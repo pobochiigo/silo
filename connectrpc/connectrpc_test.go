@@ -83,7 +83,31 @@ func TestNewConnectServer(t *testing.T) {
 		req := connect.NewRequest(&dummyProtoReq{ProtoName: "Alice"})
 
 		resp, err := handler(ctx, req)
+		assert.ErrorIs(t, err, expectedErr)
+		assert.Equal(t, connect.CodeInvalidArgument, connect.CodeOf(err))
+		assert.Nil(t, resp)
+	})
+
+	t.Run("decoder connect error preserved", func(t *testing.T) {
+		expectedErr := connect.NewError(connect.CodeUnauthenticated, errors.New("bad token"))
+		endpoint := func(ctx context.Context, req dummyReq) (dummyResp, error) {
+			t.Fatal("endpoint should not be called")
+			return dummyResp{}, nil
+		}
+
+		dec := func(ctx context.Context, pr *dummyProtoReq) (dummyReq, error) {
+			return dummyReq{}, expectedErr
+		}
+
+		enc := func(ctx context.Context, dr dummyResp) (*dummyProtoResp, error) {
+			t.Fatal("encoder should not be called")
+			return nil, nil
+		}
+
+		handler := NewConnectServer(endpoint, dec, enc)
+		resp, err := handler(context.Background(), connect.NewRequest(&dummyProtoReq{}))
 		assert.Equal(t, expectedErr, err)
+		assert.Equal(t, connect.CodeUnauthenticated, connect.CodeOf(err))
 		assert.Nil(t, resp)
 	})
 
@@ -130,7 +154,8 @@ func TestNewConnectServer(t *testing.T) {
 		req := connect.NewRequest(&dummyProtoReq{ProtoName: "Alice"})
 
 		resp, err := handler(ctx, req)
-		assert.Equal(t, expectedErr, err)
+		assert.ErrorIs(t, err, expectedErr)
+		assert.Equal(t, connect.CodeInternal, connect.CodeOf(err))
 		assert.Nil(t, resp)
 	})
 }

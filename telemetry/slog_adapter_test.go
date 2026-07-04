@@ -122,14 +122,40 @@ func TestSlogAdapter(t *testing.T) {
 		}
 	})
 
-	t.Run("context cancelled", func(t *testing.T) {
+	t.Run("context cancelled still logs", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
-		adapter := NewSlogAdapter(ctx)
-		err := adapter.Log("msg", "won't log")
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "logging aborted")
+		var buf bytes.Buffer
+		adapter := &slogAdapter{
+			ctx:    ctx,
+			logger: slog.New(slog.NewJSONHandler(&buf, nil)),
+		}
+
+		err := adapter.Log("msg", "shutdown log")
+		assert.NoError(t, err)
+
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(buf.Bytes(), &raw))
+		assert.Equal(t, "shutdown log", raw["msg"])
+	})
+
+	t.Run("lazily resolves slog default", func(t *testing.T) {
+		// The adapter is constructed BEFORE the default logger is swapped;
+		// its output must still follow the new default.
+		adapter := NewSlogAdapter(context.Background())
+
+		var buf bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+		t.Cleanup(func() { slog.SetDefault(prev) })
+
+		err := adapter.Log("msg", "late binding")
+		assert.NoError(t, err)
+
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(buf.Bytes(), &raw))
+		assert.Equal(t, "late binding", raw["msg"])
 	})
 
 	t.Run("slog fallback and error value as string", func(t *testing.T) {

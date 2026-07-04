@@ -56,7 +56,8 @@ func TestGetZeroValue(t *testing.T) {
 		{"int", "0"},
 		{"float32", "0.0"},
 		{"float64", "0.0"},
-		{"myPackage.CustomType", "myPackage.CustomType(0)"},
+		{"myPackage.CustomType", "*new(myPackage.CustomType)"},
+		{"CustomStruct", "*new(CustomStruct)"},
 	}
 
 	for _, tc := range testCases {

@@ -1,6 +1,6 @@
 module github.com/pobochiigo/silo
 
-go 1.26.4
+go 1.26.0
 
 require (
 	connectrpc.com/connect v1.20.0

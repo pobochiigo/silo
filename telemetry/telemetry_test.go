@@ -27,10 +27,16 @@ func TestInitTelemetry(t *testing.T) {
 		ServiceName:    "test-service",
 		ServiceVersion: "1.0.0",
 		Environment:    "test",
-		AlloyEndpoint:  lis.Addr().String(),
+		Endpoint:       lis.Addr().String(),
+		Insecure:       true,
 	}
 
 	ctx := context.Background()
+
+	t.Run("deprecated AlloyEndpoint alias", func(t *testing.T) {
+		assert.Equal(t, "alias:4317", Config{AlloyEndpoint: "alias:4317"}.endpoint())
+		assert.Equal(t, "new:4317", Config{Endpoint: "new:4317", AlloyEndpoint: "alias:4317"}.endpoint())
+	})
 
 	t.Run("NewResource", func(t *testing.T) {
 		res, err := NewResource(ctx, cfg)

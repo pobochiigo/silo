@@ -1,10 +1,10 @@
 # Silo: Standalone Unit of Work, Telemetry, and Middleware Generator
 
-Silo is a high-performance, zero-dependency core library containing a transactional Unit of Work engine, OpenTelemetry integrations, and a middleware decorator generator for standard Go interfaces. 
+Silo is a core library containing a transactional Unit of Work engine, OpenTelemetry integrations, and a middleware decorator generator for standard Go interfaces.
 
 ## Features
 
-- **Unit of Work (UoW)**: A driver-agnostic transaction coordinator that queues tasks to execute in a single database transaction. Out-of-the-box support for both Go standard library `database/sql` (`sqlx`) and native `pgx` (`pgxpool.Pool` and `pgx.Tx`).
+- **Unit of Work (UoW)**: A driver-agnostic transaction coordinator that queues tasks to execute in a single database transaction, with configurable retries and isolation levels. Out-of-the-box support for Go standard library `database/sql`, `sqlx` (including named queries), and native `pgx` (`pgxpool.Pool` and `pgx.Tx`).
 - **Telemetry**: OpenTelemetry bootstrappers for traces, metrics, and logs, alongside `go-kit` endpoint middlewares.
 - **Middlegen**: A command-line tool that parses Go interfaces and automatically generates production-ready middleware wrappers for logging, tracing, metrics, and UoW boundaries.
 
@@ -123,7 +123,7 @@ package service
 import (
 	"context"
 
-	"github.com/pobochiigo/silo/db"
+	mydb "my-app/db"
 )
 
 //go:generate middlegen -type=UserService -kinds=uow_service,logging,tracing
@@ -132,16 +132,16 @@ type UserService interface {
 }
 
 type userService struct {
-	repo db.UserRepository
+	repo mydb.UserRepository
 }
 
-func NewUserService(repo db.UserRepository) UserService {
+func NewUserService(repo mydb.UserRepository) UserService {
 	return &userService{repo: repo}
 }
 
 func (s *userService) CreateUser(ctx context.Context, id string, name string) error {
-	user := &db.User{ID: id, Name: name}
-	
+	user := &mydb.User{ID: id, Name: name}
+
 	// When using uow_repo middleware, calling Save will queue the database operation.
 	// It only executes and commits when this service block completes successfully.
 	return s.repo.Save(ctx, user)
@@ -187,12 +187,13 @@ import (
 func main() {
 	ctx := context.Background()
 
-	// 1. Bootstrap Telemetry
-	shutdown, err := telemetry.Bootstrap(ctx, telemetry.Config{
+	// 1. Bootstrap Telemetry (traces, metrics, and logs over OTLP gRPC)
+	shutdown, err := telemetry.InitTelemetry(ctx, telemetry.Config{
 		ServiceName:    "user-service",
 		ServiceVersion: "1.0.0",
+		Environment:    "dev",
 		Endpoint:       "localhost:4317",
-		Insecure:       true,
+		Insecure:       true, // plaintext gRPC; omit for TLS with system roots
 	})
 	if err != nil {
 		slog.Error("Failed to bootstrap telemetry", "error", err)
@@ -241,6 +242,30 @@ func main() {
 
 ---
 
+## Choosing a Transactor
+
+The `db` package ships three `uow.Transactor` adapters. Pick the one matching how your repositories execute queries:
+
+| Transactor | Injects into context | Use when |
+|---|---|---|
+| `db.NewSQLTransactor(db)` | `*sql.Tx` | Repositories use plain `database/sql` via `db.Executor`. |
+| `db.NewSQLXTransactor(sqlxDB)` | `*sqlx.Tx` | Repositories use `sqlx` via `db.XExecutor` — required for named queries (`NamedExecContext`, `Rebind`), which need the driver's bindvar type. |
+| `db.NewPGXTransactor(pool)` | `pgx.Tx` | Repositories use native `pgx` via `db.PGXExecutor`. |
+
+> **Note:** `db.XExecutor` can also wrap a plain `*sql.Tx` (begun by `SQLTransactor`) on the fly, but that wrapper has no driver name, so named queries would render `?` placeholders and fail on Postgres. Use `SQLXTransactor` if you need named queries inside transactions.
+
+Isolation levels and access modes can be set per transactor:
+
+```go
+sqlTx  := db.NewSQLTransactor(pool, db.WithSQLTxOptions(&sql.TxOptions{Isolation: sql.LevelSerializable}))
+sqlxTx := db.NewSQLXTransactor(sqlxDB, db.WithSQLXTxOptions(&sql.TxOptions{Isolation: sql.LevelRepeatableRead}))
+pgxTx  := db.NewPGXTransactor(pgxPool, db.WithPGXTxOptions(pgx.TxOptions{IsoLevel: pgx.Serializable}))
+```
+
+Combined with `uow.WithRetryEvaluator` and `uow.WithMaxRetries`, this enables automatic retry of serialization failures.
+
+---
+
 ## 4. `middlegen` CLI Reference
 
 ### Command Line Flags
@@ -254,6 +279,13 @@ func main() {
 | `-prefix` | `middlegen` | Directive prefix namespace for comment annotations. |
 | `-middleware-import` | *(Inferred)* | Import path of the generic `Middleware` helper package. |
 | `-middleware-type` | `middleware.Middleware` | The type signature representation for middlewares. |
+| `-library-module` | `github.com/pobochiigo/silo` | Module path providing the `middleware`/`telemetry`/`uow` packages referenced by generated code. |
+
+### Notes on generated code
+
+- Methods of **embedded interfaces** (e.g. `io.Closer`) are forwarded to the wrapped implementation without decoration; declare methods explicitly on the target interface to decorate them.
+- Parameters whose names collide with identifiers used by the templates (`t`, `m`, `err`, `span`, ...) are transparently renamed in the generated code; log attribute keys keep the original names.
+- Repository methods decorated with `uow_repo` that return values besides `error` return **zero values immediately** when their execution is deferred into a Unit of Work — the real execution happens at commit time. Annotate read methods with `//middlegen:non-transactional` to run them immediately instead.
 
 ---
 
@@ -316,6 +348,20 @@ clientEndpoint := connectrpc.NewConnectClient(
 ## 6. Advanced Telemetry Features
 
 In addition to bootstrapping OpenTelemetry traces, metrics, and logs, the `telemetry` package provides utilities for integrating with legacy frameworks and managing context propagation.
+
+### Configuration
+
+`telemetry.Config` fields:
+
+| Field | Description |
+|---|---|
+| `ServiceName`, `ServiceVersion`, `Environment` | Resource attributes attached to all traces, metrics, and logs. |
+| `Endpoint` | `host:port` of the OTLP gRPC collector (Grafana Alloy, OTel Collector, ...). |
+| `Insecure` | Disables TLS on exporter connections (plaintext gRPC). Defaults to `false` — TLS with the system certificate pool. |
+| `Headers` | Extra gRPC metadata sent with every export, e.g. collector auth tokens. |
+| `SkipSlogDefault` | Prevents `InitLogs` from replacing the process-wide `slog` default logger. |
+
+`InitTraces` registers the W3C `TraceContext`/`Baggage` propagators globally. Applications that skip tracing but still forward trace headers can call `telemetry.InitPropagators()` directly.
 
 ### Go-Kit Endpoint Middlewares
 Standard endpoint middlewares designed to wrap Go-Kit (`github.com/go-kit/kit/endpoint`) endpoints:
