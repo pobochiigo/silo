@@ -238,6 +238,7 @@ func main() {
 }
 ```
 
+
 ---
 
 ## 4. `middlegen` CLI Reference
@@ -253,3 +254,88 @@ func main() {
 | `-prefix` | `middlegen` | Directive prefix namespace for comment annotations. |
 | `-middleware-import` | *(Inferred)* | Import path of the generic `Middleware` helper package. |
 | `-middleware-type` | `middleware.Middleware` | The type signature representation for middlewares. |
+
+---
+
+## 5. Type-Safe Endpoints & ConnectRPC Integration
+
+Silo provides a type-safe generic endpoint abstraction and adapters for seamless integration with ConnectRPC.
+
+### Type-Safe Endpoint
+Defined in the `endpoint` package, it offers a generic signature for service endpoints, avoiding `interface{}`-based wrappers:
+```go
+package endpoint
+
+import "context"
+
+type Endpoint[Req any, Resp any] func(ctx context.Context, request Req) (Resp, error)
+```
+
+### ConnectRPC Adapters
+The `connectrpc` package adapts these type-safe endpoints to ConnectRPC server handlers and client endpoints.
+
+#### Server Handler Construction (`NewConnectServer`)
+Converts a generic `endpoint.Endpoint` into a ConnectRPC server handler, using custom decoders and encoders:
+```go
+import (
+	"github.com/pobochiigo/silo/connectrpc"
+	"github.com/pobochiigo/silo/endpoint"
+)
+
+handler := connectrpc.NewConnectServer(
+	endpoint,
+	func(ctx context.Context, protoReq *pb.MyRequest) (MyRequest, error) {
+		// decode proto message to domain request
+		return MyRequest{Name: protoReq.Name}, nil
+	},
+	func(ctx context.Context, resp MyResponse) (*pb.MyResponse, error) {
+		// encode domain response to proto message
+		return &pb.MyResponse{Id: resp.ID}, nil
+	},
+)
+```
+
+#### Client Endpoint Construction (`NewConnectClient`)
+Wraps a ConnectRPC client call inside a type-safe `endpoint.Endpoint`:
+```go
+clientEndpoint := connectrpc.NewConnectClient(
+	client.MyMethod,
+	func(ctx context.Context, req MyRequest) (*pb.MyRequest, error) {
+		// encode domain request to proto request
+		return &pb.MyRequest{Name: req.Name}, nil
+	},
+	func(ctx context.Context, protoResp *pb.MyResponse) (MyResponse, error) {
+		// decode proto response to domain response
+		return MyResponse{ID: protoResp.Id}, nil
+	},
+)
+```
+
+---
+
+## 6. Advanced Telemetry Features
+
+In addition to bootstrapping OpenTelemetry traces, metrics, and logs, the `telemetry` package provides utilities for integrating with legacy frameworks and managing context propagation.
+
+### Go-Kit Endpoint Middlewares
+Standard endpoint middlewares designed to wrap Go-Kit (`github.com/go-kit/kit/endpoint`) endpoints:
+- `MetricsMiddleware(operationName)`: Automatically records execution counts and latency durations via OTel metrics.
+- `LoggingMiddleware(operationName, logger)`: Logs execution status, elapsed time, and errors via `slog` (TraceID-correlated).
+- `TracingMiddleware(operationName)`: Automatically creates child tracing spans around endpoint execution.
+
+### Go-Kit Log Compatibility (`SlogAdapter`)
+Bridges the gap between legacy `go-kit/log.Logger` interfaces and modern standard `log/slog`. Route go-kit logs directly through your globally registered OTel bridge:
+```go
+import "github.com/pobochiigo/silo/telemetry"
+
+// Instantiates a go-kit Logger adapter mapping keyvals to structured slog
+logger := telemetry.NewSlogAdapter(ctx)
+```
+
+### Trace Context Propagation
+Injects and extracts trace contexts between Go `context.Context` and transport network layers (HTTP Headers and gRPC Metadata):
+- `ExtractHTTPTraceContext()`: HTTP server request function to parse incoming tracing headers.
+- `InjectHTTPTraceContext()`: HTTP client request function to inject outgoing tracing headers.
+- `ExtractGRPCTraceContext()`: gRPC server request handler to extract trace information from incoming metadata.
+- `InjectGRPCTraceContext()`: gRPC client request handler to inject trace information into outgoing metadata.
+```

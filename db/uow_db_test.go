@@ -23,7 +23,7 @@ func (m *mockSQLDB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, 
 
 // Mock pgx.Tx
 type mockPgxTx struct {
-	pgx.Tx // Embed to satisfy interface
+	pgx.Tx     // Embed to satisfy interface
 	committed  bool
 	rolledback bool
 }

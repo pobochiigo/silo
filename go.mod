@@ -3,6 +3,7 @@ module github.com/pobochiigo/silo
 go 1.26.4
 
 require (
+	connectrpc.com/connect v1.20.0
 	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/go-kit/kit v0.13.0
 	github.com/go-kit/log v0.2.1
