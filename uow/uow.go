@@ -3,6 +3,7 @@ package uow
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -23,7 +24,10 @@ func Extract(ctx context.Context) (*UnitOfWork, bool) {
 type TaskFn func(ctx context.Context) error
 
 // UnitOfWork queues tasks to be executed in a transactional batch.
+// It is safe to Defer tasks from multiple goroutines; the queued tasks
+// themselves are executed sequentially in Defer order.
 type UnitOfWork struct {
+	mu    sync.Mutex
 	tasks []TaskFn
 }
 
@@ -34,7 +38,18 @@ func NewUnitOfWork() *UnitOfWork {
 
 // Defer queues a task for transactional execution.
 func (uow *UnitOfWork) Defer(task TaskFn) {
+	uow.mu.Lock()
+	defer uow.mu.Unlock()
 	uow.tasks = append(uow.tasks, task)
+}
+
+// snapshot returns a copy of the queued tasks safe to iterate without the lock.
+func (uow *UnitOfWork) snapshot() []TaskFn {
+	uow.mu.Lock()
+	defer uow.mu.Unlock()
+	tasks := make([]TaskFn, len(uow.tasks))
+	copy(tasks, uow.tasks)
+	return tasks
 }
 
 // EvaluatorFn defines the signature of a function that determines if a database error is retryable.
@@ -53,10 +68,11 @@ func WithRetryEvaluator(evaluator EvaluatorFn) Option {
 	}
 }
 
-// WithMaxRetries configures the maximum retry attempts for transient transactional errors.
+// WithMaxRetries configures the maximum retry attempts for transient
+// transactional errors. Negative values are treated as 0 (no retries).
 func WithMaxRetries(retries int) Option {
 	return func(m *Manager) {
-		m.maxRetries = retries
+		m.maxRetries = max(retries, 0)
 	}
 }
 
@@ -116,14 +132,15 @@ func (m *Manager) RunWith(ctx context.Context, action ActionFn) error {
 		return err
 	}
 
-	if len(uow.tasks) == 0 {
+	tasks := uow.snapshot()
+	if len(tasks) == 0 {
 		return nil // No writes deferred; bypass opening a transaction completely
 	}
 
-	return m.commitWithRetry(ctx, uow)
+	return m.commitWithRetry(ctx, tasks)
 }
 
-func (m *Manager) commitWithRetry(ctx context.Context, uow *UnitOfWork) error {
+func (m *Manager) commitWithRetry(ctx context.Context, tasks []TaskFn) error {
 	var err error
 	for attempt := 0; attempt <= m.maxRetries; attempt++ {
 		if attempt > 0 {
@@ -136,7 +153,7 @@ func (m *Manager) commitWithRetry(ctx context.Context, uow *UnitOfWork) error {
 			}
 		}
 
-		err = m.executeTransaction(ctx, uow)
+		err = m.executeTransaction(ctx, tasks)
 		if err == nil {
 			return nil
 		}
@@ -149,7 +166,7 @@ func (m *Manager) commitWithRetry(ctx context.Context, uow *UnitOfWork) error {
 	return fmt.Errorf("transaction failed after %d retries: %w", m.maxRetries, err)
 }
 
-func (m *Manager) executeTransaction(ctx context.Context, uow *UnitOfWork) (err error) {
+func (m *Manager) executeTransaction(ctx context.Context, tasks []TaskFn) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -161,15 +178,18 @@ func (m *Manager) executeTransaction(ctx context.Context, uow *UnitOfWork) (err 
 
 	var committed bool
 	defer func() {
+		// Roll back with a non-cancellable context so cleanup still reaches
+		// the database when the caller's context has been cancelled.
+		rollbackCtx := context.WithoutCancel(ctx)
 		if r := recover(); r != nil {
-			_ = tx.Rollback(ctx)
+			_ = tx.Rollback(rollbackCtx)
 			panic(r)
 		} else if !committed {
-			_ = tx.Rollback(ctx)
+			_ = tx.Rollback(rollbackCtx)
 		}
 	}()
 
-	for _, task := range uow.tasks {
+	for _, task := range tasks {
 		if err := txCtx.Err(); err != nil {
 			return err
 		}

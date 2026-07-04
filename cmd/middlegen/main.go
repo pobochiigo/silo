@@ -19,28 +19,32 @@ import (
 type Field struct {
 	Name string
 	Type string
+	// Label preserves the original parameter name for log keys when Name
+	// had to be renamed to avoid colliding with template-declared identifiers.
+	Label string
 }
 
 type Method struct {
-	Name               string
-	Params             []Field
-	Results            []Field
-	HasContext         bool
-	HasError           bool
-	ParamsSignature    string
-	ParamsNames        string
-	ResultsSignature   string
-	ResultsVars        string
-	LogPlaceholders    string
-	LogValues          string
-	CustomAttributes   []Field
-	CustomCounters     []string
-	SlogAttributes     string
-	ParamsNamesWithTx  string
-	ParamsNamesWithUow string
-	ZeroValues         string
-	NonTransactional   bool
-	RepoDeferStmt      string
+	Name                string
+	Params              []Field
+	Results             []Field
+	HasContext          bool
+	HasError            bool
+	ParamsSignature     string
+	ParamsNames         string
+	ResultsSignature    string
+	ResultsVars         string
+	NonErrorResultsVars string
+	LogPlaceholders     string
+	LogValues           string
+	CustomAttributes    []Field
+	CustomCounters      []string
+	SlogAttributes      string
+	ParamsNamesWithTx   string
+	ParamsNamesWithUow  string
+	ZeroValues          string
+	NonTransactional    bool
+	RepoDeferStmt       string
 }
 
 type CounterMeta struct {
@@ -71,7 +75,27 @@ var (
 	prefixFlag           = flag.String("prefix", "middlegen", "Prefix namespace for comment directives (default: middlegen)")
 	middlewareImportFlag = flag.String("middleware-import", "", "Import path for the generic Middleware type definition (defaults to <library-module>/middleware)")
 	middlewareTypeFlag   = flag.String("middleware-type", "middleware.Middleware", "Fully-qualified type name for generic Middleware type")
+	libraryModuleFlag    = flag.String("library-module", "", "Module path providing the middleware/telemetry/uow packages (defaults to autodetection)")
 )
+
+// reservedParamNames are identifiers declared by the generated middleware
+// bodies (receivers and locals). Interface parameters with these names are
+// renamed to avoid shadowing or redeclaration in the generated code.
+var reservedParamNames = map[string]bool{
+	"l": true, "t": true, "m": true,
+	"err": true, "span": true, "now": true, "ctx": true,
+	"logger": true, "tracer": true, "recorder": true, "next": true,
+	"uowInstance": true, "txCtx": true, "uowCtx": true, "innerErr": true,
+}
+
+// sanitizeParamName renames parameters that would collide with identifiers
+// declared by the middleware templates.
+func sanitizeParamName(name string) string {
+	if reservedParamNames[name] || (strings.HasPrefix(name, "r") && isDigit(name[1:])) {
+		return name + "Arg"
+	}
+	return name
+}
 
 func main() {
 	flag.Parse()
@@ -108,6 +132,11 @@ func main() {
 	destPkgs, err := parser.ParseDir(destFset, cwd, filter, parser.ParseComments)
 	if err == nil {
 		for name := range destPkgs {
+			// ParseDir also returns the external test package ("foo_test");
+			// never use it as the destination package clause.
+			if strings.HasSuffix(name, "_test") {
+				continue
+			}
 			destPackageName = name
 			break
 		}
@@ -128,6 +157,9 @@ func main() {
 	var targetFile *ast.File
 
 	for name, pkg := range pkgs {
+		if strings.HasSuffix(name, "_test") {
+			continue
+		}
 		packageName = name
 		for _, file := range pkg.Files {
 			// Find interface
@@ -182,7 +214,10 @@ func main() {
 	rawInterfaceName := parts[len(parts)-1]
 
 	// Detect library module path
-	libModule := detectLibraryModule(moduleRoot)
+	libModule := *libraryModuleFlag
+	if libModule == "" {
+		libModule = detectLibraryModule(moduleRoot)
+	}
 
 	mwImport := *middlewareImportFlag
 	if mwImport == "" {
@@ -211,6 +246,15 @@ func main() {
 	}
 
 	for _, methodField := range interfaceType.Methods.List {
+		if len(methodField.Names) == 0 {
+			// Embedded interface (e.g. io.Closer): its methods are not
+			// visible from the AST of this file, so no middleware is
+			// generated for them. The generated wrappers embed the wrapped
+			// implementation, so these methods are forwarded undecorated.
+			log.Printf("Warning: methods of embedded interface %s in %s are forwarded without middleware; declare them explicitly to decorate them",
+				getASTNodeString(fset, methodField.Type), *typeFlag)
+			continue
+		}
 		methodName := methodField.Names[0].Name
 		funcType, ok := methodField.Type.(*ast.FuncType)
 		if !ok {
@@ -271,25 +315,39 @@ func main() {
 		// Parse Parameters
 		if funcType.Params != nil {
 			paramIdx := 0
+			ctxNamed := false
 			for _, p := range funcType.Params.List {
 				typeStr := getASTNodeString(fset, p.Type)
 				if isCrossPackage {
 					typeStr = qualifyType(typeStr, declaredTypes, alias)
 				}
+				var names []string
 				if len(p.Names) == 0 {
-					name := fmt.Sprintf("p%d", paramIdx)
-					method.Params = append(method.Params, Field{Name: name, Type: typeStr})
-					paramIdx++
+					names = []string{fmt.Sprintf("p%d", paramIdx)}
 				} else {
 					for _, nameIdent := range p.Names {
-						method.Params = append(method.Params, Field{Name: nameIdent.Name, Type: typeStr})
-						paramIdx++
+						names = append(names, nameIdent.Name)
 					}
+				}
+				for _, name := range names {
+					label := name
+					// Templates reference the context parameter as "ctx",
+					// regardless of how the interface names it.
+					if typeStr == "context.Context" && !ctxNamed {
+						name, label = "ctx", "ctx"
+						ctxNamed = true
+					} else {
+						name = sanitizeParamName(name)
+					}
+					method.Params = append(method.Params, Field{Name: name, Type: typeStr, Label: label})
+					paramIdx++
 				}
 			}
 		}
 
-		// Parse Results
+		// Parse Results. Result names from the interface declaration are
+		// deliberately ignored: generated bodies declare their own locals
+		// (r0..rN, plus "err" for a trailing error).
 		if funcType.Results != nil {
 			resultIdx := 0
 			for _, r := range funcType.Results.List {
@@ -297,19 +355,17 @@ func main() {
 				if isCrossPackage {
 					typeStr = qualifyType(typeStr, declaredTypes, alias)
 				}
-				if len(r.Names) == 0 {
-					name := fmt.Sprintf("r%d", resultIdx)
-					if typeStr == "error" {
-						name = "err"
-					}
-					method.Results = append(method.Results, Field{Name: name, Type: typeStr})
-					resultIdx++
-				} else {
-					for _, nameIdent := range r.Names {
-						method.Results = append(method.Results, Field{Name: nameIdent.Name, Type: typeStr})
-						resultIdx++
-					}
+				count := len(r.Names)
+				if count == 0 {
+					count = 1
 				}
+				for i := 0; i < count; i++ {
+					method.Results = append(method.Results, Field{Name: fmt.Sprintf("r%d", resultIdx), Type: typeStr})
+					resultIdx++
+				}
+			}
+			if n := len(method.Results); n > 0 && method.Results[n-1].Type == "error" {
+				method.Results[n-1].Name = "err"
 			}
 		}
 
@@ -330,19 +386,27 @@ func main() {
 
 		for _, p := range method.Params {
 			paramsSig = append(paramsSig, fmt.Sprintf("%s %s", p.Name, p.Type))
-			paramsNames = append(paramsNames, p.Name)
+			callName := p.Name
+			if strings.HasPrefix(p.Type, "...") {
+				callName += "..." // variadic params must be re-spread when forwarding
+			}
+			paramsNames = append(paramsNames, callName)
 			if p.Type != "context.Context" {
-				logPlaceholders = append(logPlaceholders, fmt.Sprintf("%s=%%v", p.Name))
+				logPlaceholders = append(logPlaceholders, fmt.Sprintf("%s=%%v", p.Label))
 				logValues = append(logValues, p.Name)
-				slogAttrs = append(slogAttrs, fmt.Sprintf("slog.Any(%q, %s)", p.Name, p.Name))
+				slogAttrs = append(slogAttrs, fmt.Sprintf("slog.Any(%q, %s)", p.Label, p.Name))
 			}
 		}
 
 		var resultsSig []string
 		var resultsVars []string
+		var nonErrorResultsVars []string
 		for _, r := range method.Results {
 			resultsSig = append(resultsSig, r.Type)
 			resultsVars = append(resultsVars, r.Name)
+			if r.Type != "error" {
+				nonErrorResultsVars = append(nonErrorResultsVars, r.Name)
+			}
 		}
 
 		method.ParamsSignature = strings.Join(paramsSig, ", ")
@@ -352,6 +416,7 @@ func main() {
 			method.ResultsSignature = "(" + method.ResultsSignature + ")"
 		}
 		method.ResultsVars = strings.Join(resultsVars, ", ")
+		method.NonErrorResultsVars = strings.Join(nonErrorResultsVars, ", ")
 		method.LogPlaceholders = strings.Join(logPlaceholders, " ")
 		method.LogValues = strings.Join(logValues, ", ")
 		method.SlogAttributes = strings.Join(slogAttrs, ", ")
@@ -363,8 +428,12 @@ func main() {
 				paramsNamesWithTx = append(paramsNamesWithTx, "txCtx")
 				paramsNamesWithUow = append(paramsNamesWithUow, "uowCtx")
 			} else {
-				paramsNamesWithTx = append(paramsNamesWithTx, p.Name)
-				paramsNamesWithUow = append(paramsNamesWithUow, p.Name)
+				callName := p.Name
+				if strings.HasPrefix(p.Type, "...") {
+					callName += "..."
+				}
+				paramsNamesWithTx = append(paramsNamesWithTx, callName)
+				paramsNamesWithUow = append(paramsNamesWithUow, callName)
 			}
 		}
 		method.ParamsNamesWithTx = strings.Join(paramsNamesWithTx, ", ")
@@ -560,11 +629,12 @@ import (
 func {{.InterfaceNameWithoutPackage}}LoggingMiddleware() {{.MiddlewareType}}[{{.InterfaceName}}] {
 	logger := slog.Default().With(slog.String("service", "{{$.ServiceName}}"))
 	return func(next {{.InterfaceName}}) {{.InterfaceName}} {
-		return &{{.InterfaceNameLower}}LoggingService{next: next, logger: logger}
+		return &{{.InterfaceNameLower}}LoggingService{ {{.InterfaceNameWithoutPackage}}: next, next: next, logger: logger}
 	}
 }
 
 type {{.InterfaceNameLower}}LoggingService struct {
+	{{.InterfaceName}} // forwards methods of embedded interfaces undecorated
 	next   {{.InterfaceName}}
 	logger *slog.Logger
 }
@@ -573,9 +643,9 @@ type {{.InterfaceNameLower}}LoggingService struct {
 func (l *{{$.InterfaceNameLower}}LoggingService) {{.Name}}({{.ParamsSignature}}) {{.ResultsSignature}} {
 	{{if .HasContext}}l.logger.InfoContext(ctx, "{{.Name}} started"{{if .SlogAttributes}}, {{.SlogAttributes}}{{end}}){{end}}
 	{{if .Results}}{{if .HasContext}}
-	{{end}}{{.ResultsVars}} := l.next.{{.Name}}({{.ParamsNames}}){{if .HasError}}
+	{{end}}{{.ResultsVars}} := l.next.{{.Name}}({{.ParamsNames}}){{if and .HasError .HasContext}}
 	if err != nil {
-		{{if .HasContext}}l.logger.ErrorContext(ctx, "{{.Name}} failed", slog.Any("error", err)){{end}}
+		l.logger.ErrorContext(ctx, "{{.Name}} failed", slog.Any("error", err))
 	}{{end}}
 
 	return {{.ResultsVars}}
@@ -602,11 +672,12 @@ import (
 func {{.InterfaceNameWithoutPackage}}TracingMiddleware() {{.MiddlewareType}}[{{.InterfaceName}}] {
 	tracer := otel.Tracer("{{$.ServiceName}}")
 	return func(next {{.InterfaceName}}) {{.InterfaceName}} {
-		return &{{.InterfaceNameLower}}TracingService{next: next, tracer: tracer}
+		return &{{.InterfaceNameLower}}TracingService{ {{.InterfaceNameWithoutPackage}}: next, next: next, tracer: tracer}
 	}
 }
 
 type {{.InterfaceNameLower}}TracingService struct {
+	{{.InterfaceName}} // forwards methods of embedded interfaces undecorated
 	next   {{.InterfaceName}}
 	tracer trace.Tracer
 }
@@ -617,7 +688,7 @@ func (t *{{$.InterfaceNameLower}}TracingService) {{.Name}}({{.ParamsSignature}})
 	defer span.End()
 
 	{{end}}{{if .Results}}{{if .HasContext}}
-	{{end}}{{.ResultsVars}} := t.next.{{.Name}}({{.ParamsNames}}){{if .HasError}}
+	{{end}}{{.ResultsVars}} := t.next.{{.Name}}({{.ParamsNames}}){{if and .HasError .HasContext}}
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
@@ -658,6 +729,7 @@ func {{.InterfaceNameWithoutPackage}}MetricsMiddleware() {{.MiddlewareType}}[{{.
 
 	return func(next {{.InterfaceName}}) {{.InterfaceName}} {
 		return &{{.InterfaceNameLower}}MetricsService{
+			{{.InterfaceNameWithoutPackage}}: next,
 			next:     next,
 			recorder: recorder,
 			{{range .CustomCounters}}
@@ -668,6 +740,7 @@ func {{.InterfaceNameWithoutPackage}}MetricsMiddleware() {{.MiddlewareType}}[{{.
 }
 
 type {{.InterfaceNameLower}}MetricsService struct {
+	{{.InterfaceName}} // forwards methods of embedded interfaces undecorated
 	next     {{.InterfaceName}}
 	recorder *telemetry.MetricsRecorder
 	{{range .CustomCounters}}
@@ -683,7 +756,7 @@ func (m *{{$.InterfaceNameLower}}MetricsService) {{.Name}}({{.ParamsSignature}})
 	{{end}}
 	{{if .Results}}{{if .HasContext}}
 	{{end}}{{.ResultsVars}} := m.next.{{.Name}}({{.ParamsNames}}){{if .HasContext}}
-	m.recorder.Observe(ctx, "{{.Name}}", now, err,
+	m.recorder.Observe(ctx, "{{.Name}}", now, {{if .HasError}}err{{else}}nil{{end}},
 		{{range .CustomAttributes}}attribute.String("{{.Name}}", fmt.Sprintf("%v", {{.Type}})),
 		{{end}}
 	)
@@ -756,24 +829,13 @@ func getModuleName(moduleRoot string) (string, error) {
 	return "", fmt.Errorf("module name not found in go.mod")
 }
 
+const defaultLibraryModule = "github.com/pobochiigo/silo"
+
 func detectLibraryModule(moduleRoot string) string {
-	moduleName, err := getModuleName(moduleRoot)
-	if err == nil {
-		if moduleName == "github.com/chessclub/backend-common-library/v3" || moduleName == "github.com/pobochiigo/silo" {
-			return moduleName
-		}
+	if moduleName, err := getModuleName(moduleRoot); err == nil && moduleName == defaultLibraryModule {
+		return moduleName
 	}
-	data, err := os.ReadFile(filepath.Join(moduleRoot, "go.mod"))
-	if err == nil {
-		content := string(data)
-		if strings.Contains(content, "github.com/pobochiigo/silo") {
-			return "github.com/pobochiigo/silo"
-		}
-		if strings.Contains(content, "github.com/chessclub/backend-common-library/v3") {
-			return "github.com/chessclub/backend-common-library/v3"
-		}
-	}
-	return "github.com/pobochiigo/silo"
+	return defaultLibraryModule
 }
 
 func qualifyType(typeStr string, declaredTypes map[string]bool, alias string) string {
@@ -895,10 +957,9 @@ func getZeroValue(typeStr string) string {
 	if typeStr == "float32" || typeStr == "float64" {
 		return "0.0"
 	}
-	if strings.Contains(typeStr, ".") {
-		return typeStr + "(0)"
-	}
-	return typeStr + "(0)"
+	// *new(T) yields the zero value of any type, including structs,
+	// interfaces, and named types, where a T(0) conversion would not compile.
+	return "*new(" + typeStr + ")"
 }
 
 const uowRepoTemplate = `// Code generated by middlegen. DO NOT EDIT.
@@ -914,11 +975,12 @@ import (
 
 func {{.InterfaceNameWithoutPackage}}UoWMiddleware() {{.MiddlewareType}}[{{.InterfaceName}}] {
 	return func(next {{.InterfaceName}}) {{.InterfaceName}} {
-		return &{{.InterfaceNameLower}}UoWMiddleware{next: next}
+		return &{{.InterfaceNameLower}}UoWMiddleware{ {{.InterfaceNameWithoutPackage}}: next, next: next}
 	}
 }
 
 type {{.InterfaceNameLower}}UoWMiddleware struct {
+	{{.InterfaceName}} // forwards methods of embedded interfaces undecorated
 	next {{.InterfaceName}}
 }
 
@@ -948,11 +1010,12 @@ import (
 
 func {{.InterfaceNameWithoutPackage}}UoWMiddleware(manager *uow.Manager) {{.MiddlewareType}}[{{.InterfaceName}}] {
 	return func(next {{.InterfaceName}}) {{.InterfaceName}} {
-		return &{{.InterfaceNameLower}}UoWMiddleware{next: next, manager: manager}
+		return &{{.InterfaceNameLower}}UoWMiddleware{ {{.InterfaceNameWithoutPackage}}: next, next: next, manager: manager}
 	}
 }
 
 type {{.InterfaceNameLower}}UoWMiddleware struct {
+	{{.InterfaceName}} // forwards methods of embedded interfaces undecorated
 	next    {{.InterfaceName}}
 	manager *uow.Manager
 }
@@ -964,18 +1027,28 @@ func (m *{{$.InterfaceNameLower}}UoWMiddleware) {{.Name}}({{.ParamsSignature}}) 
 		return m.manager.RunWith(ctx, func(uowCtx context.Context) error {
 			return m.next.{{.Name}}({{.ParamsNamesWithUow}})
 		})
-		{{- else if .Results}}
+		{{- else if and .Results .HasError}}
 		var (
-			{{range $index, $r := .Results}}
-			{{- if ne $r.Type "error"}}r{{$index}} {{$r.Type}}
+			{{range .Results}}
+			{{- if ne .Type "error"}}{{.Name}} {{.Type}}
 			{{end}}{{end}}err error
 		)
 		err = m.manager.RunWith(ctx, func(uowCtx context.Context) error {
 			var innerErr error
-			{{range $index, $r := .Results}}{{if ne $r.Type "error"}}r{{$index}}{{end}}{{end}}, innerErr = m.next.{{.Name}}({{.ParamsNamesWithUow}})
+			{{.NonErrorResultsVars}}, innerErr = m.next.{{.Name}}({{.ParamsNamesWithUow}})
 			return innerErr
 		})
-		return {{range $index, $r := .Results}}{{if ne $r.Type "error"}}r{{$index}}, {{end}}{{end}}err
+		return {{.NonErrorResultsVars}}, err
+		{{- else if .Results}}
+		var (
+			{{range .Results}}{{.Name}} {{.Type}}
+			{{end}}
+		)
+		_ = m.manager.RunWith(ctx, func(uowCtx context.Context) error {
+			{{.ResultsVars}} = m.next.{{.Name}}({{.ParamsNamesWithUow}})
+			return nil
+		})
+		return {{.ResultsVars}}
 		{{- else}}
 		_ = m.manager.RunWith(ctx, func(uowCtx context.Context) error {
 			m.next.{{.Name}}({{.ParamsNamesWithUow}})

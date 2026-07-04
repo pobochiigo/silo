@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 )
@@ -16,9 +17,18 @@ type MetricsRecorder struct {
 }
 
 func NewMetricsRecorder(meter metric.Meter, subsystem string) *MetricsRecorder {
-	requestCounter, _ := meter.Int64Counter(subsystem+"_requests_total", metric.WithDescription("Total number of requests"))
-	errorCounter, _ := meter.Int64Counter(subsystem+"_errors_total", metric.WithDescription("Total number of failed requests"))
-	latencyHistogram, _ := meter.Float64Histogram(subsystem+"_request_duration_seconds", metric.WithDescription("Request latency in seconds"))
+	requestCounter, err := meter.Int64Counter(subsystem+"_requests_total", metric.WithDescription("Total number of requests"))
+	if err != nil {
+		otel.Handle(err)
+	}
+	errorCounter, err := meter.Int64Counter(subsystem+"_errors_total", metric.WithDescription("Total number of failed requests"))
+	if err != nil {
+		otel.Handle(err)
+	}
+	latencyHistogram, err := meter.Float64Histogram(subsystem+"_request_duration_seconds", metric.WithDescription("Request latency in seconds"))
+	if err != nil {
+		otel.Handle(err)
+	}
 
 	return &MetricsRecorder{
 		meter:            meter,

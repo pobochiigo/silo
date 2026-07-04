@@ -13,20 +13,19 @@ import (
 // ensuring compatibility with legacy go-kit servers while routing all logs
 // through the globally registered OpenTelemetry logger.
 type slogAdapter struct {
-	ctx    context.Context
-	logger *slog.Logger
+	ctx context.Context
 
-	// We dynamically fetch slog.Default() so that calling slog.SetDefault(otelLogger)
-	// automatically updates where this adapter sends its logs.
+	// logger is an optional explicit target. When nil, slog.Default() is
+	// resolved at log time, so a later slog.SetDefault(otelLogger) — e.g.
+	// from InitLogs — automatically redirects this adapter's output.
+	logger *slog.Logger
 }
 
 // NewSlogAdapter creates a new go-kit compatible logger backed by slog.
+// The adapter resolves slog.Default() lazily on every Log call, so it can be
+// constructed before InitLogs/InitTelemetry without losing OTel routing.
 func NewSlogAdapter(ctx context.Context) log.Logger {
-	return &slogAdapter{
-		ctx: ctx,
-		// Fetch the default slog logger (which is your OTel logger!)
-		logger: slog.Default(),
-	}
+	return &slogAdapter{ctx: ctx}
 }
 
 // Log implements the go-kit/log.Logger interface.
@@ -74,14 +73,16 @@ func (a *slogAdapter) Log(keyvals ...any) error {
 		msg = "go-kit internal log"
 	}
 
-	if err := a.ctx.Err(); err != nil {
-		return fmt.Errorf("logging aborted: %w", err)
+	logger := a.logger
+	if logger == nil {
+		logger = slog.Default()
 	}
 
 	// Slog requires a context to perform OTel trace-correlation.
-	// Go-kit's basic Log interface does not pass a context.
-	// We use context.Background() as a fallback.
-	a.logger.LogAttrs(a.ctx, level, msg, attrs...)
+	// Go-kit's basic Log interface does not pass a context, so the adapter
+	// uses the context captured at construction. Log records are emitted
+	// even if that context has been cancelled: shutdown-path logs matter.
+	logger.LogAttrs(a.ctx, level, msg, attrs...)
 
 	return nil
 }
