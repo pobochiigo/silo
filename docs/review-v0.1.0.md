@@ -20,11 +20,11 @@ between paths, where the context said one thing and the code assumed another.
 
 | # | Severity | Finding | Status |
 |---|---|---|---|
-| H1 | High | `RunInTx` nested in a `RunWith` action ran its action with no transaction at all. | Fixed: returns `uow.ErrNoTransaction`. |
+| H1 | High | `RunInTx` nested in a `RunWith` action ran its action with no transaction at all. | Fixed: returns `uow.ErrNoTransaction`. Superseded in v0.3.0, see below. |
 | H2 | High | `RunWith`/`RunInTx` called with a context carrying an open transaction but no unit of work (a deferred task) opened a second transaction inside the first. | Fixed: joins the open transaction. |
 | M1 | Medium | A task that deferred more work, or a late `Defer` from a goroutine, lost that work silently. | Fixed: `uow.ErrLateDefer`. |
-| M2 | Design decision | Inside `RunInTx` the generated `uow_repo` middleware queues writes, as in `RunWith`, so callers get echoed inputs and reads in the same action do not see the writes. | Kept as is, by the maintainer's decision: the unit of work stays the single writer. |
-| M3 | Medium | `uow_service` could only wrap methods in `RunWith`; read-modify-write service methods had no way to get `RunInTx`. | Fixed: `//middlegen:in-tx`. |
+| M2 | Design decision | Inside `RunInTx` the generated `uow_repo` middleware queues writes, as in `RunWith`, so callers get echoed inputs and reads in the same action do not see the writes. | Kept as is, by the maintainer's decision: the unit of work stays the single writer. Superseded in v0.3.0, see below. |
+| M3 | Medium | `uow_service` could only wrap methods in `RunWith`; read-modify-write service methods had no way to get `RunInTx`. | Fixed: `//middlegen:in-tx`. Superseded in v0.3.0, see below. |
 | M4 | Medium | An executor helper called with a transaction of the other driver family in the context fell back to the pool, running the statement outside the transaction. | Fixed: panics with a message naming both sides. |
 | L1 | Low | `db.PGXCommon` had no `SendBatch`/`CopyFrom`, so batches and COPY could not run through the unit of work. | Fixed. |
 | L2 | Low | `db.SQLXCommon` exposed three sqlx methods; the sqlx query helpers were unreachable through `XExecutor`. | Fixed: the full shared surface, satisfying `sqlx.ExtContext`. |
@@ -229,3 +229,25 @@ These changes call for a minor version bump (v0.2.0):
   failures and deadlocks retried, and the balance and entry invariants held;
   the zero-infrastructure generator tour; trace propagation over HTTP and
   gRPC metadata; Connect error mapping over the wire.
+
+## Superseded in v0.3.0
+
+A follow-up review of the two execution models concluded that `RunInTx` as a
+second model (an action carrying a unit of work inside an open transaction)
+gained nothing from deferral and cost composition: an `in-tx` method could
+not be called from a `RunWith` method, and its writes were queued behind a
+transaction that was already open. The model was collapsed to one:
+
+- `RunInTx` runs its function as the single task of a unit of work. The
+  context carries the transaction and no unit, so decorated writes execute
+  at once with real results. Inside a `RunWith` action it queues the function
+  on that boundary instead of failing, so `ErrNoTransaction` is gone (H1 is
+  subsumed); inside a task it runs the function immediately (H2 unchanged).
+- M2 no longer applies: there is no unit inside a `RunInTx` task to queue on.
+- M3's `//middlegen:in-tx` keeps its name and now means "run as one task". It
+  is accepted only on methods that return just `error`, because a queued
+  call returns before its body runs.
+- The recommended shape for a write that depends on a read is a conditional
+  write (README, "Read-modify-write: put the check in the write"); the
+  ledger example's `Transfer` was rewritten that way and `ApplyInterest`
+  shows the `in-tx` task.
