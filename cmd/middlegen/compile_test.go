@@ -35,7 +35,7 @@ func TestGeneratedCodeCompiles(t *testing.T) {
 	// Scaffold a consumer module that depends on silo via a replace directive.
 	goMod := `module example.com/genverify
 
-go 1.26.0
+go 1.27.1
 
 require github.com/pobochiigo/silo v0.0.0
 
