@@ -29,7 +29,9 @@ go install github.com/pobochiigo/silo/cmd/middlegen@latest
 silo/
 ├── cmd/
 │   └── middlegen/       # Middleware decorator generator CLI
-├── db/                  # SQL and PGX database transaction adapters
+├── connectrpc/          # ConnectRPC adapters for type-safe endpoints
+├── db/                  # SQL, sqlx and pgx database transaction adapters
+├── endpoint/            # Generic, type-safe endpoint signature
 ├── middleware/          # Generic middleware type definitions
 ├── telemetry/           # OpenTelemetry trackers, exporters, and middlewares
 └── uow/                 # Core Unit of Work transaction orchestrator
@@ -49,6 +51,46 @@ graph TD
 
 ---
 
+## The transaction model
+
+`uow.Manager` offers two entry points. Pick deliberately: they differ in what the transaction covers.
+
+### `RunWith`: deferred writes
+
+1. The business action runs **first, outside any transaction**, with a context carrying a fresh `uow.UnitOfWork`. Repository reads made here go straight to the connection pool.
+2. Repository methods decorated with the `uow_repo` middleware do not execute; they **queue** themselves on the unit of work and return immediately (see [What deferred methods return](#what-deferred-methods-return)).
+3. When the action returns `nil`, a transaction is opened and the queued tasks run inside it, in order, followed by a commit. No transaction is opened when nothing was queued.
+4. If a task or the commit fails with an error the retry evaluator accepts, the **queued tasks** are re-run in a fresh transaction. The action is not re-run, so the closures execute with the values they captured in step 1.
+
+The transaction, its isolation level and the retries therefore cover the deferred writes only. Reads made in the action are not isolated, and a read-modify-write flow can act on data that changed between the read and the commit.
+
+### `RunInTx`: everything inside the transaction
+
+1. The transaction is opened **first**. The action runs with a context carrying both the transaction and a fresh unit of work, so repository reads (and any immediate writes) execute inside the transaction under its isolation level.
+2. Deferred tasks run in the same transaction after the action returns `nil`, then the transaction is committed.
+3. On a retryable error the **whole action** is re-run in a fresh transaction. The action must therefore be safe to repeat with respect to side effects outside the database.
+
+Use `RunInTx` for read-modify-write logic that must be isolated; use `RunWith` when the action is pure computation plus writes and you want to avoid holding a transaction open.
+
+### Nesting and multiple databases
+
+A nested `RunWith`/`RunInTx` call (a context that already carries a unit of work) joins the outer boundary: it runs immediately and its deferred tasks are committed by the outer call. The `db` package stores one active transaction per context, so nesting boundaries that belong to **different databases** is not supported: the inner tasks would run against the outer transaction.
+
+### Retrying serialization failures
+
+```go
+transactor := db.NewPGXTransactor(pool, db.WithPGXTxOptions(pgx.TxOptions{IsoLevel: pgx.Serializable}))
+manager := uow.NewManager(transactor,
+    uow.WithRetryEvaluator(db.IsRetryableTxError), // SQLSTATE 40001 and 40P01
+    uow.WithMaxRetries(3),
+    uow.WithRetryDelay(50*time.Millisecond, time.Second),
+)
+```
+
+`db.IsRetryableTxError` recognises PostgreSQL `serialization_failure` (40001) and `deadlock_detected` (40P01) through any driver whose errors expose `SQLState()`, which includes pgx and lib/pq. Retries back off exponentially from the base delay up to the cap, minus up to 25% random jitter so colliding workers do not retry in lock-step.
+
+---
+
 ## Comprehensive End-to-End Walkthrough
 
 Below is a complete implementation walkthrough demonstrating how to define database repositories, build a service layer, annotate them for `middlegen`, and wire everything up using a native PostgreSQL `pgx` connection.
@@ -65,7 +107,6 @@ package db
 
 import (
 	"context"
-	"errors"
 
 	"github.com/pobochiigo/silo/db"
 )
@@ -80,7 +121,7 @@ type UserRepository interface {
 	//middlegen:non-transactional
 	GetByID(ctx context.Context, id string) (*User, error)
 
-	Save(ctx context.Context, user *User) error
+	Save(ctx context.Context, user *User) (*User, error)
 }
 
 type postgresUserRepository struct {
@@ -104,17 +145,17 @@ func (r *postgresUserRepository) GetByID(ctx context.Context, id string) (*User,
 	return &user, nil
 }
 
-func (r *postgresUserRepository) Save(ctx context.Context, user *User) error {
+func (r *postgresUserRepository) Save(ctx context.Context, user *User) (*User, error) {
 	executor := db.PGXExecutor(ctx, r.pool)
 
 	_, err := executor.Exec(ctx, "INSERT INTO users (id, name) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET name=$2", user.ID, user.Name)
-	return err
+	return user, err
 }
 ```
 
 ### Step 2: Define the Service & Annotate for `middlegen`
 
-The service layer orchestrates business logic and manages the Unit of Work lifecycle boundaries. We use the `uow_service` kind to auto-wrap service execution in `uow.Manager.RunWith` boundaries, enabling transactional isolation and automated retries.
+The service layer orchestrates business logic and manages the Unit of Work lifecycle boundaries. We use the `uow_service` kind to auto-wrap service execution in `uow.Manager.RunWith` boundaries: writes queued by the repository are committed in one transaction when the service method returns, with automatic retries of transient failures.
 
 `service/user_service.go`:
 ```go
@@ -142,9 +183,14 @@ func NewUserService(repo mydb.UserRepository) UserService {
 func (s *userService) CreateUser(ctx context.Context, id string, name string) error {
 	user := &mydb.User{ID: id, Name: name}
 
-	// When using uow_repo middleware, calling Save will queue the database operation.
-	// It only executes and commits when this service block completes successfully.
-	return s.repo.Save(ctx, user)
+	// With the uow_repo middleware, Save queues the database write and hands
+	// `user` straight back: it is the source of truth until the commit.
+	saved, err := s.repo.Save(ctx, user)
+	if err != nil {
+		return err
+	}
+	_ = saved // == user while deferred
+	return nil
 }
 ```
 
@@ -211,11 +257,11 @@ func main() {
 
 	// 3. Create Unit of Work Manager
 	transactor := db.NewPGXTransactor(pool)
-	uowManager := uow.NewManager(transactor)
+	uowManager := uow.NewManager(transactor, uow.WithRetryEvaluator(db.IsRetryableTxError))
 
 	// 4. Instantiate and Decorate the Repository
 	rawRepo := mydb.NewUserRepository(pool)
-	
+
 	// Apply Repository decorators (ordering: innermost is raw implementation)
 	repo := mydb.UserRepositoryUoWMiddleware()(rawRepo)
 	repo = mydb.UserRepositoryLoggingMiddleware()(repo)
@@ -239,7 +285,6 @@ func main() {
 }
 ```
 
-
 ---
 
 ## Choosing a Transactor
@@ -252,7 +297,7 @@ The `db` package ships three `uow.Transactor` adapters. Pick the one matching ho
 | `db.NewSQLXTransactor(sqlxDB)` | `*sqlx.Tx` | Repositories use `sqlx` via `db.XExecutor` — required for named queries (`NamedExecContext`, `Rebind`), which need the driver's bindvar type. |
 | `db.NewPGXTransactor(pool)` | `pgx.Tx` | Repositories use native `pgx` via `db.PGXExecutor`. |
 
-> **Note:** `db.XExecutor` can also wrap a plain `*sql.Tx` (begun by `SQLTransactor`) on the fly, but that wrapper has no driver name, so named queries would render `?` placeholders and fail on Postgres. Use `SQLXTransactor` if you need named queries inside transactions.
+> **Note:** `db.XExecutor` can also wrap a plain `*sql.Tx` (begun by `SQLTransactor`) on the fly, inheriting the name mapper of a `*sqlx.DB` fallback (or sqlx's default mapper otherwise), but that wrapper has no driver name, so named queries would render `?` placeholders and fail on Postgres. Use `SQLXTransactor` if you need named queries inside transactions. `XExecutor` panics if the context carries an executor it cannot adapt, rather than silently running your statements outside the transaction.
 
 Isolation levels and access modes can be set per transactor:
 
@@ -262,11 +307,11 @@ sqlxTx := db.NewSQLXTransactor(sqlxDB, db.WithSQLXTxOptions(&sql.TxOptions{Isola
 pgxTx  := db.NewPGXTransactor(pgxPool, db.WithPGXTxOptions(pgx.TxOptions{IsoLevel: pgx.Serializable}))
 ```
 
-Combined with `uow.WithRetryEvaluator` and `uow.WithMaxRetries`, this enables automatic retry of serialization failures.
+`WithPGXTxOptions` needs a pool that implements `BeginTx(ctx, pgx.TxOptions)` such as `*pgxpool.Pool`; `NewPGXTransactor` panics at construction otherwise, so the misconfiguration surfaces at startup rather than on the first request.
 
 ---
 
-## 4. `middlegen` CLI Reference
+## `middlegen` CLI Reference
 
 ### Command Line Flags
 
@@ -281,15 +326,42 @@ Combined with `uow.WithRetryEvaluator` and `uow.WithMaxRetries`, this enables au
 | `-middleware-type` | `middleware.Middleware` | The type signature representation for middlewares. |
 | `-library-module` | `github.com/pobochiigo/silo` | Module path providing the `middleware`/`telemetry`/`uow` packages referenced by generated code. |
 
+### Directives
+
+Directives are comments placed on interface methods (doc comment or trailing line comment), prefixed with `-prefix`:
+
+| Directive | Applies to | Effect |
+|---|---|---|
+| `//middlegen:non-transactional` | `uow_repo` | Run the method immediately even inside a unit of work. Use it for reads. |
+| `//middlegen:echo <param>[, <param>...]` | `uow_repo` | Return the named parameters, in order, as the deferred method's non-error results. `echo none` disables echoing. |
+| `//middlegen:redact <param>[, <param>...]` | `logging` | Log the named parameters as `[REDACTED]`. |
+| `//middlegen:metric attr:<name>=<expr>` | `metrics` | Add a metric attribute computed from a Go expression over the parameters. |
+| `//middlegen:metric counter:<name>` | `metrics` | Increment a custom counter on every call. |
+
+> **Cardinality warning:** metric attributes become label values on every series. Never derive them from unbounded inputs such as user or order IDs.
+
+### What deferred methods return
+
+A `uow_repo` method that runs inside a unit of work is queued, not executed, so it has to return *something* immediately. Silo hands the caller back the object it passed in, which is the source of truth for a write that has not happened yet:
+
+- `//middlegen:echo` decides explicitly which parameters are returned.
+- Otherwise, a result is echoed when **exactly one** parameter has its type (a `*T` parameter also satisfies a `T` result, guarded against `nil`, and vice versa) and that type is not a basic type (`string`, `int`, `bool`, ...). `Save(ctx, user *User) (*User, error)` returns `user`.
+- Every other result is its zero value. Basic-typed results are never echoed from parameters; when several parameters are candidates, the generator warns and returns the zero value until you add an `echo` directive.
+
+Read methods must be annotated `//middlegen:non-transactional` so they execute immediately and return real data.
+
 ### Notes on generated code
 
 - Methods of **embedded interfaces** (e.g. `io.Closer`) are forwarded to the wrapped implementation without decoration; declare methods explicitly on the target interface to decorate them.
-- Parameters whose names collide with identifiers used by the templates (`t`, `m`, `err`, `span`, ...) are transparently renamed in the generated code; log attribute keys keep the original names.
-- Repository methods decorated with `uow_repo` that return values besides `error` return **zero values immediately** when their execution is deferred into a Unit of Work — the real execution happens at commit time. Annotate read methods with `//middlegen:non-transactional` to run them immediately instead.
+- Parameters whose names collide with identifiers used by the templates (`t`, `m`, `err`, `ok`, `span`, and the packages the templates import such as `time` or `uow`) are transparently renamed in the generated code; log attribute keys and `metric attr` expressions keep the original names.
+- The logging middleware logs the `<Method> started` line with all parameters at `Debug` level and failures at `Error` level. Redact secrets with `//middlegen:redact`.
+- A `uow_service` method that returns no `error` cannot report a failed commit; the generated wrapper logs the failure through `slog.Default()` and the generator prints a warning naming the method. Prefer returning an error.
+- Generic interfaces (type parameters) are not supported; the generator refuses them with a clear message.
+- Imports of the interface's file are copied into the generated files only when a method signature references them.
 
 ---
 
-## 5. Type-Safe Endpoints & ConnectRPC Integration
+## Type-Safe Endpoints & ConnectRPC Integration
 
 Silo provides a type-safe generic endpoint abstraction and adapters for seamless integration with ConnectRPC.
 
@@ -304,10 +376,10 @@ type Endpoint[Req any, Resp any] func(ctx context.Context, request Req) (Resp, e
 ```
 
 ### ConnectRPC Adapters
-The `connectrpc` package adapts these type-safe endpoints to ConnectRPC server handlers and client endpoints.
+The `connectrpc` package adapts these type-safe endpoints to ConnectRPC server handlers and client endpoints. The endpoint sees only the decoded message: request headers, response headers and trailers are not exposed. Handle them in a Connect interceptor, or read them in the decoder, which receives the raw `*connect.Request`'s message and context.
 
 #### Server Handler Construction (`NewConnectServer`)
-Converts a generic `endpoint.Endpoint` into a ConnectRPC server handler, using custom decoders and encoders:
+Converts a generic `endpoint.Endpoint` into a ConnectRPC server handler, using custom decoders and encoders. Decode failures are reported as `CodeInvalidArgument` and encode failures as `CodeInternal` unless the error already carries a Connect code; endpoint errors pass through untouched.
 ```go
 import (
 	"github.com/pobochiigo/silo/connectrpc"
@@ -345,7 +417,7 @@ clientEndpoint := connectrpc.NewConnectClient(
 
 ---
 
-## 6. Advanced Telemetry Features
+## Advanced Telemetry Features
 
 In addition to bootstrapping OpenTelemetry traces, metrics, and logs, the `telemetry` package provides utilities for integrating with legacy frameworks and managing context propagation.
 
@@ -355,13 +427,21 @@ In addition to bootstrapping OpenTelemetry traces, metrics, and logs, the `telem
 
 | Field | Description |
 |---|---|
-| `ServiceName`, `ServiceVersion`, `Environment` | Resource attributes attached to all traces, metrics, and logs. |
-| `Endpoint` | `host:port` of the OTLP gRPC collector (Grafana Alloy, OTel Collector, ...). |
+| `ServiceName`, `ServiceVersion`, `Environment` | Resource attributes attached to all traces, metrics, and logs. The environment is emitted as both `deployment.environment.name` (current semantic conventions) and `deployment.environment`. Empty values are left out so `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` can fill them; non-empty values win over the environment. |
+| `Endpoint` | `host:port` of the OTLP gRPC collector (Grafana Alloy, OTel Collector, ...). When empty, the exporters use `OTEL_EXPORTER_OTLP_ENDPOINT` and then the OTLP default `localhost:4317`. |
 | `Insecure` | Disables TLS on exporter connections (plaintext gRPC). Defaults to `false` — TLS with the system certificate pool. |
 | `Headers` | Extra gRPC metadata sent with every export, e.g. collector auth tokens. |
 | `SkipSlogDefault` | Prevents `InitLogs` from replacing the process-wide `slog` default logger. |
+| `LocalLogHandler` | Handler that receives every record in addition to the OTLP exporter. Defaults to a text handler on stderr. |
+| `DisableLocalLogs` | Send logs to the collector only. Note that `slog.SetDefault` also routes the standard `log` package through slog, so nothing is written locally. |
+
+The resource also carries the `telemetry.sdk.*` attributes and the semantic-conventions schema URL.
 
 `InitTraces` registers the W3C `TraceContext`/`Baggage` propagators globally. Applications that skip tracing but still forward trace headers can call `telemetry.InitPropagators()` directly.
+
+### Logs
+
+`InitLogs` installs a default `slog` logger that fans every record out to a local handler (stderr by default, or `LocalLogHandler`) **and** to the OTLP exporter through the official OTel bridge, so log lines carry the active trace and span IDs without disappearing from the machine when the collector is unreachable. `telemetry.NewFanoutHandler` is exported for building your own combinations.
 
 ### Go-Kit Endpoint Middlewares
 Standard endpoint middlewares designed to wrap Go-Kit (`github.com/go-kit/kit/endpoint`) endpoints:
@@ -384,4 +464,3 @@ Injects and extracts trace contexts between Go `context.Context` and transport n
 - `InjectHTTPTraceContext()`: HTTP client request function to inject outgoing tracing headers.
 - `ExtractGRPCTraceContext()`: gRPC server request handler to extract trace information from incoming metadata.
 - `InjectGRPCTraceContext()`: gRPC client request handler to inject trace information into outgoing metadata.
-```

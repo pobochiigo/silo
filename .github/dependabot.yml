@@ -1,0 +1,19 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      opentelemetry:
+        patterns:
+          - "go.opentelemetry.io/*"
+      grpc:
+        patterns:
+          - "google.golang.org/grpc"
+          - "google.golang.org/protobuf"
+          - "google.golang.org/genproto/*"
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

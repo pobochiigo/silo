@@ -2,14 +2,92 @@ package telemetry
 
 import (
 	"context"
+	"log/slog"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
 	"google.golang.org/grpc"
 )
+
+// countingListener counts accepted connections so a test can prove an
+// exporter actually dialled this address.
+type countingListener struct {
+	net.Listener
+	accepted atomic.Int32
+}
+
+func (l *countingListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err == nil {
+		l.accepted.Add(1)
+	}
+	return c, err
+}
+
+func TestInitTelemetry_EmptyEndpointHonoursEnvironment(t *testing.T) {
+	raw, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	lis := &countingListener{Listener: raw}
+
+	s := grpc.NewServer()
+	go func() { _ = s.Serve(lis) }()
+	t.Cleanup(s.Stop)
+
+	// No Endpoint in Config: the exporters must fall back to the standard
+	// OTLP environment variable instead of dialling an empty address.
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://"+lis.Addr().String())
+
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	ctx := context.Background()
+	shutdown, err := InitTelemetry(ctx, Config{ServiceName: "env-test", Insecure: true})
+	require.NoError(t, err)
+
+	// Produce a span so the trace exporter has something to flush.
+	_, span := otel.Tracer("env-test").Start(ctx, "op")
+	span.End()
+	_ = shutdown(ctx) // the dummy server answers Unimplemented; only the dial matters
+
+	assert.Greater(t, lis.accepted.Load(), int32(0), "exporter never connected to the env endpoint")
+}
+
+func TestNewResource(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("OTEL_SERVICE_NAME", "from-env")
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "team=platform")
+
+	attrsOf := func(cfg Config) map[string]string {
+		t.Helper()
+		res, err := NewResource(ctx, cfg)
+		require.NoError(t, err)
+		assert.NotEmpty(t, res.SchemaURL())
+		out := map[string]string{}
+		for _, kv := range res.Attributes() {
+			out[string(kv.Key)] = kv.Value.AsString()
+		}
+		return out
+	}
+
+	explicit := attrsOf(Config{ServiceName: "explicit", ServiceVersion: "1.2.3", Environment: "prod"})
+	assert.Equal(t, "explicit", explicit["service.name"], "config wins over OTEL_SERVICE_NAME")
+	assert.Equal(t, "1.2.3", explicit["service.version"])
+	assert.Equal(t, "prod", explicit["deployment.environment.name"])
+	assert.Equal(t, "prod", explicit["deployment.environment"], "legacy key kept for existing dashboards")
+	assert.Equal(t, "platform", explicit["team"], "OTEL_RESOURCE_ATTRIBUTES merged")
+	assert.Equal(t, "opentelemetry", explicit["telemetry.sdk.name"])
+	assert.Equal(t, "go", explicit["telemetry.sdk.language"])
+
+	blank := attrsOf(Config{})
+	assert.Equal(t, "from-env", blank["service.name"], "environment fills blanks")
+	_, hasEnv := blank["deployment.environment.name"]
+	assert.False(t, hasEnv, "empty config values must not emit empty attributes")
+}
 
 func TestInitTelemetry(t *testing.T) {
 	// Start a mock gRPC server to receive telemetry connections
@@ -45,9 +123,15 @@ func TestInitTelemetry(t *testing.T) {
 	})
 
 	t.Run("InitTelemetry success", func(t *testing.T) {
+		// InitLogs replaces the process-wide default logger; put it back so
+		// later tests in this package do not log into a shut-down provider.
+		prev := slog.Default()
+		t.Cleanup(func() { slog.SetDefault(prev) })
+
 		shutdown, err := InitTelemetry(ctx, cfg)
 		assert.NoError(t, err)
 		assert.NotNil(t, shutdown)
+		assert.NotSame(t, prev, slog.Default(), "InitLogs installs a new default logger")
 
 		// Verify NewLogger works
 		logger := NewLogger(ctx, cfg)
