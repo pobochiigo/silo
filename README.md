@@ -43,7 +43,7 @@ The [`examples`](examples/) directory is a separate Go module with runnable prog
 | Example | Shows |
 |---|---|
 | [`examples/middlegen`](examples/middlegen/) | Every directive on one interface, all four kinds of generated middleware, when deferred writes really execute, generation into another package. Runs without any infrastructure. |
-| [`examples/uow`](examples/uow/) | A ledger service on database/sql, sqlx and pgx with the same generated middlewares; `RunWith` deferral, `RunInTx` with `//middlegen:in-tx`, SERIALIZABLE retries under concurrency and the nesting rules, against PostgreSQL. |
+| [`examples/uow`](examples/uow/) | A ledger service on database/sql, sqlx and pgx with the same generated middlewares; `RunWith` boundaries with the check in the write, a `//middlegen:in-tx` task, SERIALIZABLE retries under concurrency and the nesting rules, against PostgreSQL. |
 | [`examples/telemetry`](examples/telemetry/) | `InitTelemetry`, the go-kit endpoint middlewares, trace propagation over HTTP and gRPC metadata, the go-kit log adapter and the fan-out handler. |
 | [`examples/connectrpc`](examples/connectrpc/) | A Connect RPC served from a type-safe endpoint and called through a type-safe client endpoint. |
 
@@ -95,43 +95,42 @@ graph TD
 
 ## The transaction model
 
-`uow.Manager` offers two entry points. Pick deliberately: they differ in what the transaction covers.
+`uow.Manager` runs one model: the unit of work. A **boundary** (`RunWith`) runs business logic first and commits the writes it queued afterwards, in one transaction. A **task** is the transactional part: it runs with the transaction open, and repository calls made from a task execute immediately. `RunInTx` runs one function as a task.
 
-### `RunWith`: deferred writes
+### `RunWith`: the boundary
 
 1. The business action runs **first, outside any transaction**, with a context carrying a fresh `uow.UnitOfWork`. Repository reads made here go straight to the connection pool.
 2. Repository methods decorated with the `uow_repo` middleware do not execute; they **queue** themselves on the unit of work and return immediately (see [What deferred methods return](#what-deferred-methods-return)).
 3. When the action returns `nil`, a transaction is opened and the queued tasks run inside it, in order, followed by a commit. No transaction is opened when nothing was queued.
 4. If a task or the commit fails with an error the retry evaluator accepts, the **queued tasks** are re-run in a fresh transaction. The action is not re-run, so the closures execute with the values they captured in step 1.
 
-The transaction, its isolation level and the retries therefore cover the deferred writes only. Reads made in the action are not isolated, and a read-modify-write flow can act on data that changed between the read and the commit.
+The transaction, its isolation level and the retries therefore cover the queued tasks only. The action never holds a connection or a lock, which is what makes it safe to call other services, HTTP clients or queues from it.
 
-### `RunInTx`: everything inside the transaction
+### `RunInTx`: one task
 
-1. The transaction is opened **first**. The action runs with a context carrying both the transaction and a fresh unit of work, so repository reads execute inside the transaction under its isolation level. Writes made through the generated `uow_repo` middleware are queued exactly as in `RunWith`.
-2. The queued writes (and any task deferred by hand) run in the same transaction after the action returns `nil`, then the transaction is committed.
-3. On a retryable error the **whole action** is re-run in a fresh transaction. The action must therefore be safe to repeat with respect to side effects outside the database.
+1. The transaction is opened **first** and the function runs inside it. Its context carries the transaction but **no unit of work**, so reads run under the transaction's isolation level and decorated writes execute at once, with real results.
+2. The transaction commits when the function returns `nil` and rolls back when it returns an error.
+3. On a retryable error the **whole function** is re-run in a fresh transaction. A task therefore only talks to the database: an HTTP call made from it would hold the transaction open for the round trip and be repeated on retry.
 
-### Choosing between them
+Called inside a `RunWith` action, `RunInTx` opens nothing: it queues the function on that boundary's unit of work and returns `nil` at once. The function runs in the boundary's transaction, in `Defer` order, and its error is returned by the boundary. Called inside a task, the function runs immediately. See [Nesting](#nesting).
 
-Both models queue the writes and run them in one transaction. They differ in **when that transaction opens**, and therefore in what the reads see and what a retry repeats:
+The generated `uow_service` middleware wraps every method in `RunWith`; a method marked `//middlegen:in-tx` runs as one task through `RunInTx` instead. Such a method must return only an `error`, because a queued call returns before its body runs (see the [directives](#directives)).
 
-| | `RunWith` | `RunInTx` |
-|---|---|---|
-| Transaction opens | after the action returns, and only if something was queued | before the action runs, always |
-| Reads made by the action | on the pool, each in its own autocommit snapshot | inside the transaction, under its isolation level |
-| Writes | queued, run before the commit | queued, run before the commit (the same) |
-| Retry after a serialization failure or deadlock | re-runs the queued writes with the values they captured | re-runs the **whole action**, reads included |
-| Cost | the shortest possible transaction | the transaction stays open for the whole action |
+### Read-modify-write: put the check in the write
 
-The difference matters as soon as a write depends on a read. Take a `Transfer` that reads a balance, checks it, and queues a debit, with two concurrent transfers of 8000 from an account holding 10000:
+Under `RunWith`, a check made in the action and a write queued on it are not linked. Take a `Transfer` that reads a balance, compares it with the amount, and queues a debit, with two concurrent transfers of 8000 from an account holding 10000: both read 10000 on the pool, both pass the check, both debits are queued, and either the balance goes to -6000 or a `CHECK` constraint rejects the second one with a hard error. Neither is a retry.
 
-- Under `RunWith` both read 10000 on the pool, both pass the check, and both debits are queued. Nothing links the check to the write, so either both commit and the balance goes to -6000, or a database constraint rejects the second with a hard error. Neither is a retry.
-- Under `RunInTx` with a SERIALIZABLE transactor, both reads happen inside their transaction. The database sees that each transaction's decision rested on a read the other one invalidated, aborts one with `SQLSTATE 40001`, and the manager re-runs that whole action: it re-reads 2000 and returns "insufficient funds".
+The unit of work's answer is to let the database check and write atomically, in one statement:
 
-The rule of thumb: a method whose writes depend on what it read belongs in `RunInTx`; a method that only records facts it was given (create, append, update by key) is fine in `RunWith`, which never holds a transaction open during business logic. Because `RunInTx` re-runs the action, the action must be safe to repeat with respect to side effects outside the database.
+```sql
+UPDATE accounts SET balance = balance + $1 WHERE id = $2 AND balance + $1 >= 0
+```
 
-The generated `uow_service` middleware uses `RunWith`; mark a method `//middlegen:in-tx` to wrap it in `RunInTx` instead (see the [walkthrough](#step-2-define-the-service--annotate-for-middlegen) and the [directives](#directives)).
+The repository maps "no row updated" to `ErrInsufficientFunds`; the service queues the debit as before and gets that error back from the boundary. This needs no isolation level and no retry, the row lock lasts for one statement, and the service method stays a plain `RunWith` boundary that composes with any other. Keep a `CHECK (balance >= 0)` constraint as the safety net. The [uow example](examples/uow/) does exactly this.
+
+When one statement cannot express the invariant (a rule over several rows or tables), do the read and the write in a **task**, where the transaction is open: a hand-written `Defer`, or a service method marked `//middlegen:in-tx`. Lock what you read (`SELECT ... FOR UPDATE`) or use a `SERIALIZABLE` transactor with `db.IsRetryableTxError` as the retry evaluator, so a conflicting task is re-run instead of committing on stale data.
+
+Two things no boundary can do: branch in the action on the outcome of a queued write, since the write has not happened yet, and call external services from a task. A flow that needs either is a workflow, not a unit of work.
 
 ### Using the unit of work directly
 
@@ -139,7 +138,7 @@ The generated `uow_repo` middleware is a convenience: any code can queue work on
 
 ```go
 err := manager.RunWith(ctx, func(ctx context.Context) error {
-	unit, _ := uow.Extract(ctx) // always present inside RunWith and RunInTx
+	unit, _ := uow.Extract(ctx) // present inside a RunWith action
 	unit.Defer(func(txCtx context.Context) error {
 		_, err := db.PGXExecutor(txCtx, pool).Exec(txCtx,
 			"INSERT INTO users (id, name) VALUES ($1, $2)", id, name)
@@ -149,17 +148,30 @@ err := manager.RunWith(ctx, func(ctx context.Context) error {
 })
 ```
 
+`RunInTx` is the same task on its own: the transaction is open, so every statement runs where it is written, and the whole function is re-run on a retryable error.
+
+```go
+err := manager.RunInTx(ctx, func(txCtx context.Context) error {
+	ex := db.PGXExecutor(txCtx, pool)
+	var balance int64
+	if err := ex.QueryRow(txCtx, "SELECT balance FROM accounts WHERE id = $1 FOR UPDATE", id).Scan(&balance); err != nil {
+		return err
+	}
+	_, err := ex.Exec(txCtx, "UPDATE accounts SET balance = $1 WHERE id = $2", balance+interest(balance), id)
+	return err
+})
+```
+
 ### Nesting
 
-Boundaries nest by joining what the context already carries. The three cases:
+Boundaries nest by joining what the context already carries. The two cases:
 
 | The context carries | `RunWith` | `RunInTx` |
 |---|---|---|
-| A unit of work **and** an open transaction (inside a `RunInTx` action) | Joins: runs the action now; deferred work belongs to the outer unit. | Joins the same way. |
-| A unit of work but **no transaction yet** (inside a `RunWith` action) | Joins. | Returns `uow.ErrNoTransaction`: it cannot deliver the isolation it promises. Make the outer boundary `RunInTx` (with `middlegen`, mark the service method `//middlegen:in-tx`). |
-| An open transaction but **no unit of work** (inside a deferred task) | Runs the action in that transaction with a fresh unit whose tasks run right after it; the outer boundary commits. | Same. |
+| A unit of work (inside a `RunWith` action) | Joins: runs the action now; the work it defers belongs to the outer unit. | Queues the task on that unit and returns `nil` at once. The task runs in the boundary's transaction, in `Defer` order, and its error is returned by the boundary. |
+| An open transaction and **no unit of work** (inside a task) | Runs the action in that transaction with a fresh unit whose tasks run right after it; the outer boundary commits. | Runs the task now. |
 
-A second transaction is never opened inside a first one. `uow.InTransaction(ctx)` tells any code which situation it is in. A task that calls `Defer` on the unit that is executing it, or a goroutine that outlives the action and defers late, is reported with `uow.ErrLateDefer` instead of being silently dropped. Contexts handed to actions and tasks must not outlive their boundary.
+A second transaction is never opened inside a first one, and a `RunWith` method may call an `in-tx` method or the other way round: both compose. `uow.InTransaction(ctx)` tells any code which situation it is in. A task that calls `Defer` on the unit that is executing it, or a goroutine that outlives the action and defers late, is reported with `uow.ErrLateDefer` instead of being silently dropped. Contexts handed to actions and tasks must not outlive their boundary.
 
 ### Multiple databases
 
@@ -244,7 +256,7 @@ func (r *postgresUserRepository) Save(ctx context.Context, user *User) (*User, e
 
 ### Step 2: Define the Service & Annotate for `middlegen`
 
-The service layer orchestrates business logic and manages the Unit of Work lifecycle boundaries. We use the `uow_service` kind to auto-wrap service execution in `uow.Manager.RunWith` boundaries: writes queued by the repository are committed in one transaction when the service method returns, with automatic retries of transient failures. A method that must read and write under one isolation level is marked `//middlegen:in-tx` and wrapped in `RunInTx` instead.
+The service layer orchestrates business logic and manages the Unit of Work lifecycle boundaries. We use the `uow_service` kind to auto-wrap service execution in `uow.Manager.RunWith` boundaries: writes queued by the repository are committed in one transaction when the service method returns, with automatic retries of transient failures. A method that must read and write inside the transaction (a rule over several rows) is marked `//middlegen:in-tx` and runs as one task through `RunInTx` instead; see [Read-modify-write](#read-modify-write-put-the-check-in-the-write).
 
 `service/user_service.go`:
 ```go
@@ -434,7 +446,7 @@ Directives are comments on the methods of the interface, written `//<prefix>:<di
 | Directive | Applies to | Effect |
 |---|---|---|
 | `//middlegen:non-transactional` | `uow_repo` | Run the method immediately even inside a unit of work. Use it for reads. |
-| `//middlegen:in-tx` | `uow_service` | Wrap the method in `Manager.RunInTx` (transaction opened first, whole method isolated and retried) instead of the deferred-write `RunWith`. |
+| `//middlegen:in-tx` | `uow_service` | Run the method as one task through `Manager.RunInTx`: the transaction is open before the body, decorated writes execute at once, and the whole body is re-run on a retryable error. Called inside a `RunWith` boundary the method is queued on it. The method must return only an `error`. |
 | `//middlegen:echo <param>[, <param>...]` | `uow_repo` | Return the named parameters, in order, as the deferred method's non-error results. `echo none` disables echoing. |
 | `//middlegen:redact <param>[, <param>...]` | `logging` | Log the named parameters as `[REDACTED]`. |
 | `//middlegen:metric attr:<name>=<expr>` | `metrics` | Add a metric attribute computed from a Go expression over the parameters. |
@@ -613,7 +625,7 @@ Every kind produces one file, `<iface><suffix>`, where `<iface>` is the interfac
 | `tracing` | `<Iface>TracingMiddleware()` | `_tracing_middleware.gen.go` | Span `<service>.<Method>` of kind internal from `otel.Tracer(<service>)`; on error `RecordError` and status `Error`. Methods without a context are forwarded unchanged. |
 | `metrics` | `<Iface>MetricsMiddleware()` | `_metrics_middleware.gen.go` | On meter `<service>`: `<iface>_requests_total`, `<iface>_errors_total` and `<iface>_request_duration_seconds` (seconds, `DefaultLatencyBuckets`) with attribute `method` plus the `metric attr` attributes; one `Int64Counter` per `metric counter` name, without attributes. Methods without a context are measured with a background context. |
 | `uow_repo` | `<Iface>UoWMiddleware()` | `_uow_middleware.gen.go` | Methods with a context and without `non-transactional` are queued on the unit of work in the context and return immediately (see [What deferred methods return](#what-deferred-methods-return)); everything else passes through. |
-| `uow_service` | `<Iface>UoWMiddleware(manager *uow.Manager)` | `_uow_middleware.gen.go` | Every method with a context runs inside `manager.RunWith`, or `manager.RunInTx` when marked `//middlegen:in-tx`, so the writes it makes through decorated repositories commit when it returns. A nested call joins the outer boundary (see [Nesting](#nesting)). |
+| `uow_service` | `<Iface>UoWMiddleware(manager *uow.Manager)` | `_uow_middleware.gen.go` | Every method with a context runs inside `manager.RunWith`, so the writes it makes through decorated repositories commit when it returns; a method marked `//middlegen:in-tx` runs as one task through `manager.RunInTx`. A nested call joins the outer boundary (see [Nesting](#nesting)). |
 
 `uow_repo` and `uow_service` write the same file and constructor name, so generate one or the other for a given interface: repositories get `uow_repo`, the services calling them get `uow_service`.
 
@@ -645,7 +657,7 @@ A `uow_repo` method that runs inside a unit of work is queued, not executed, so 
 - Otherwise, a result is echoed when **exactly one** parameter has its type (a `*T` parameter also satisfies a `T` result, guarded against `nil`, and vice versa) and that type is not a basic type (`string`, `int`, `bool`, ...). `Save(ctx, user *User) (*User, error)` returns `user`.
 - Every other result is its zero value. Basic-typed results are never echoed from parameters; when several parameters are candidates, the generator warns and returns the zero value until you add an `echo` directive.
 
-Read methods must be annotated `//middlegen:non-transactional` so they execute immediately and return real data. Inside a deferred task the context carries no unit of work, so a decorated call made from a task executes immediately as well.
+Read methods must be annotated `//middlegen:non-transactional` so they execute immediately and return real data. Inside a task, whether deferred by hand or a `//middlegen:in-tx` method, the context carries no unit of work, so a decorated call made there executes immediately as well and returns real results.
 
 ### Notes on generated code
 
