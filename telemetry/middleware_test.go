@@ -206,7 +206,7 @@ func TestTracingMiddleware(t *testing.T) {
 		require.Len(t, exporter.spans, 1)
 		span := exporter.spans[0]
 		assert.Equal(t, "TestOp", span.Name())
-		assert.Equal(t, sdktrace.Status{Code: codes.Ok, Description: ""}, span.Status())
+		assert.Equal(t, sdktrace.Status{Code: codes.Unset}, span.Status(), "instrumentation leaves successful spans unset")
 	})
 
 	t.Run("failed span", func(t *testing.T) {
