@@ -13,11 +13,29 @@
 //     returns, and only the queued tasks run inside it. Reads performed by
 //     the action are not isolated, and a retry re-runs the queued closures
 //     with whatever values they captured. This is the cheapest model and the
-//     one the middlegen "uow_repo"/"uow_service" wrappers target.
+//     one the middlegen "uow_repo"/"uow_service" wrappers target by default.
 //   - [Manager.RunInTx] (transactional model): the transaction is opened
 //     first and the action runs inside it, so reads, immediate writes and
 //     deferred tasks all share the transaction and its isolation level. A
 //     retry re-runs the whole action in a fresh transaction.
+//
+// # Nesting
+//
+// Boundaries nest by joining what the context already carries:
+//
+//   - A UnitOfWork and an open transaction (a RunInTx action, or a boundary
+//     joined inside one): RunWith and RunInTx run their action immediately;
+//     work it defers belongs to the outer unit.
+//   - A UnitOfWork but no transaction yet (a RunWith action): RunWith joins.
+//     RunInTx cannot provide the transaction it promises and returns
+//     [ErrNoTransaction]; make the outer boundary RunInTx instead.
+//   - An open transaction but no UnitOfWork (a deferred task): RunWith and
+//     RunInTx run their action inside that transaction with a fresh unit whose
+//     tasks run right after the action, and leave the commit to the outer
+//     boundary.
+//
+// [InTransaction] reports whether a context carries an open transaction. A
+// context handed to an action or a task must not outlive its boundary.
 //
 // # Single database
 //
@@ -29,6 +47,7 @@ package uow
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"sync"
@@ -36,6 +55,22 @@ import (
 )
 
 type uowKey struct{}
+
+type txKey struct{}
+
+// ErrNoTransaction is returned by [Manager.RunInTx] when it is called inside
+// a RunWith boundary: the outer action runs before its transaction is opened,
+// so the inner action could not run inside one. Make the outer boundary
+// RunInTx (with middlegen, mark the service method //middlegen:in-tx) or move
+// the transactional work out of the RunWith action.
+var ErrNoTransaction = errors.New("uow: RunInTx called inside a RunWith boundary whose transaction is not open yet")
+
+// ErrLateDefer is returned when tasks were queued on a unit of work after it
+// had started executing its tasks, typically by a task itself or by a
+// goroutine that outlived the action. Those tasks never run; defer from the
+// action instead, or call the repository directly from the task, where the
+// transaction is already open.
+var ErrLateDefer = errors.New("uow: Defer called while the unit of work was executing its tasks")
 
 // Inject injects the Unit of Work into the context.
 func Inject(ctx context.Context, uow *UnitOfWork) context.Context {
@@ -48,12 +83,28 @@ func Extract(ctx context.Context) (*UnitOfWork, bool) {
 	return uow, ok
 }
 
+// InTransaction reports whether ctx carries a database transaction opened by
+// a Manager. It is true for the context a RunInTx action receives and for
+// the context deferred tasks run with, and false inside a RunWith action,
+// where writes are still to be queued. Code that must not defer once the
+// transaction is open (such as the generated uow_repo middleware) checks it.
+func InTransaction(ctx context.Context) bool {
+	return ctx.Value(txKey{}) == true
+}
+
+// markTransaction records on ctx that a transaction is open.
+func markTransaction(ctx context.Context) context.Context {
+	return context.WithValue(ctx, txKey{}, true)
+}
+
 // TaskFn defines the signature of a deferred task to be executed within a transaction.
 type TaskFn func(ctx context.Context) error
 
 // UnitOfWork queues tasks to be executed in a transactional batch.
-// It is safe to Defer tasks from multiple goroutines; the queued tasks
-// themselves are executed sequentially in Defer order.
+// It is safe to Defer tasks from multiple goroutines while the action runs;
+// the queued tasks themselves are executed sequentially in Defer order.
+// Deferring after the action returned (from a task, or from a goroutine the
+// action did not wait for) is reported as [ErrLateDefer].
 type UnitOfWork struct {
 	mu    sync.Mutex
 	tasks []TaskFn
@@ -78,6 +129,13 @@ func (uow *UnitOfWork) snapshot() []TaskFn {
 	tasks := make([]TaskFn, len(uow.tasks))
 	copy(tasks, uow.tasks)
 	return tasks
+}
+
+// count returns the number of tasks queued so far.
+func (uow *UnitOfWork) count() int {
+	uow.mu.Lock()
+	defer uow.mu.Unlock()
+	return len(uow.tasks)
 }
 
 // EvaluatorFn defines the signature of a function that determines if a database error is retryable.
@@ -125,6 +183,8 @@ type Tx interface {
 }
 
 // Transactor defines the generic contract for beginning database transactions.
+// BeginTx returns the transaction and a context derived from ctx that carries
+// it, so executors resolved from that context run inside the transaction.
 type Transactor interface {
 	BeginTx(ctx context.Context) (Tx, context.Context, error)
 }
@@ -169,25 +229,31 @@ func NewManager(database Transactor, opts ...Option) *Manager {
 // only. Read-modify-write logic that must be isolated belongs in [Manager.RunInTx].
 //
 // When ctx already carries a UnitOfWork, action joins it: it runs immediately
-// and its deferred tasks are committed by the outer boundary.
+// and its deferred tasks are committed by the outer boundary. When ctx carries
+// an open transaction but no UnitOfWork (inside a deferred task), action runs
+// in that transaction with a fresh unit whose tasks run right after it, and
+// the outer boundary commits.
 func (m *Manager) RunWith(ctx context.Context, action ActionFn) error {
 	if _, ok := Extract(ctx); ok {
 		return action(ctx)
 	}
+	if InTransaction(ctx) {
+		return runJoined(ctx, action)
+	}
 
-	uow := NewUnitOfWork()
-	if err := action(Inject(ctx, uow)); err != nil {
+	unit := NewUnitOfWork()
+	if err := action(Inject(ctx, unit)); err != nil {
 		return err
 	}
 
-	tasks := uow.snapshot()
+	tasks := unit.snapshot()
 	if len(tasks) == 0 {
 		return nil // No writes deferred; bypass opening a transaction completely
 	}
 
 	return m.withRetry(ctx, func(ctx context.Context) error {
 		return m.inTransaction(ctx, func(txCtx context.Context) error {
-			return runTasks(txCtx, tasks)
+			return runTasks(txCtx, unit, tasks)
 		})
 	})
 }
@@ -196,7 +262,9 @@ func (m *Manager) RunWith(ctx context.Context, action ActionFn) error {
 //
 //  1. A transaction is opened first. action runs with a context that carries
 //     both the transaction (so repository reads and immediate writes execute
-//     inside it) and a new UnitOfWork.
+//     inside it) and a new UnitOfWork. [InTransaction] is true for it, so the
+//     generated uow_repo middleware executes writes immediately instead of
+//     queueing them.
 //  2. Tasks deferred during action run in the same transaction after action
 //     returns nil, then the transaction is committed. An error from action
 //     rolls back.
@@ -204,22 +272,39 @@ func (m *Manager) RunWith(ctx context.Context, action ActionFn) error {
 //     action is re-run in a fresh transaction. action must therefore be safe
 //     to repeat with respect to side effects outside the database.
 //
-// When ctx already carries a UnitOfWork, action joins the outer boundary and
-// no transaction is opened here.
+// When ctx already carries an open transaction, action joins it and no
+// transaction is opened here: inside a RunInTx action it shares the outer
+// unit; inside a deferred task it gets a fresh unit whose tasks run right
+// after it. When ctx carries a UnitOfWork whose transaction is not open yet
+// (a RunWith action), RunInTx returns [ErrNoTransaction] rather than run the
+// action without the isolation it promises.
 func (m *Manager) RunInTx(ctx context.Context, action ActionFn) error {
 	if _, ok := Extract(ctx); ok {
+		if !InTransaction(ctx) {
+			return ErrNoTransaction
+		}
 		return action(ctx)
+	}
+	if InTransaction(ctx) {
+		return runJoined(ctx, action)
 	}
 
 	return m.withRetry(ctx, func(ctx context.Context) error {
 		return m.inTransaction(ctx, func(txCtx context.Context) error {
-			uow := NewUnitOfWork()
-			if err := action(Inject(txCtx, uow)); err != nil {
-				return err
-			}
-			return runTasks(txCtx, uow.snapshot())
+			return runJoined(txCtx, action)
 		})
 	})
+}
+
+// runJoined runs action inside the open transaction txCtx carries, with a
+// fresh unit of work, then runs the tasks action deferred in the same
+// transaction. Committing is left to whoever opened the transaction.
+func runJoined(txCtx context.Context, action ActionFn) error {
+	unit := NewUnitOfWork()
+	if err := action(Inject(txCtx, unit)); err != nil {
+		return err
+	}
+	return runTasks(txCtx, unit, unit.snapshot())
 }
 
 // withRetry runs attempt until it succeeds, returns a non-retryable error,
@@ -269,7 +354,8 @@ func (m *Manager) backoff(n int) time.Duration {
 }
 
 // inTransaction begins a transaction, runs body with the transactional
-// context, and commits; any failure or panic rolls back.
+// context (marked so InTransaction reports true), and commits; any failure
+// or panic rolls back.
 func (m *Manager) inTransaction(ctx context.Context, body func(txCtx context.Context) error) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -279,6 +365,7 @@ func (m *Manager) inTransaction(ctx context.Context, body func(txCtx context.Con
 	if err != nil {
 		return err
 	}
+	txCtx = markTransaction(txCtx)
 
 	var committed bool
 	defer func() {
@@ -306,8 +393,9 @@ func (m *Manager) inTransaction(ctx context.Context, body func(txCtx context.Con
 }
 
 // runTasks executes tasks in order with txCtx, stopping at the first error
-// or once txCtx is done.
-func runTasks(txCtx context.Context, tasks []TaskFn) error {
+// or once txCtx is done. Tasks queued on unit while running would never
+// execute, so their presence afterwards is reported as ErrLateDefer.
+func runTasks(txCtx context.Context, unit *UnitOfWork, tasks []TaskFn) error {
 	for _, task := range tasks {
 		if err := txCtx.Err(); err != nil {
 			return err
@@ -315,6 +403,9 @@ func runTasks(txCtx context.Context, tasks []TaskFn) error {
 		if err := task(txCtx); err != nil {
 			return err
 		}
+	}
+	if unit.count() > len(tasks) {
+		return ErrLateDefer
 	}
 	return nil
 }
