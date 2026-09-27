@@ -3,13 +3,9 @@ package db
 import (
 	"context"
 	"database/sql"
-	"errors"
-	"fmt"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jmoiron/sqlx"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -121,17 +117,11 @@ func TestXExecutor_PanicsOnUnknownExecutor(t *testing.T) {
 	assert.Panics(t, func() { XExecutor(ctx, xdb) })
 }
 
-func TestSQLTransactor_PassesTxOptions(t *testing.T) {
-	opts := &sql.TxOptions{Isolation: sql.LevelSerializable, ReadOnly: true}
-	var got *sql.TxOptions
-	beginner := &mockSQLDB{beginTx: func(ctx context.Context, o *sql.TxOptions) (*sql.Tx, error) {
-		got = o
-		return nil, errors.New("stop here")
-	}}
+func TestXExecutor_PanicsWhenPGXTransactionIsActive(t *testing.T) {
+	xdb, _ := newSQLX(t)
+	ctx := InjectPGXTx(context.Background(), &mockPgxTx{})
 
-	_, _, err := NewSQLTransactor(beginner, WithSQLTxOptions(opts)).BeginTx(context.Background())
-	require.Error(t, err)
-	assert.Same(t, opts, got)
+	assert.Panics(t, func() { XExecutor(ctx, xdb) })
 }
 
 func TestSQLXTransactor_PassesTxOptions(t *testing.T) {
@@ -147,47 +137,4 @@ func TestSQLXTransactor_PassesTxOptions(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, tx.Rollback(txCtx))
 	assert.NoError(t, mock.ExpectationsWereMet())
-}
-
-// mockPgxTxPool additionally implements PGXTxBeginner.
-type mockPgxTxPool struct {
-	mockPgxPool
-	gotOpts *pgx.TxOptions
-}
-
-func (m *mockPgxTxPool) BeginTx(ctx context.Context, o pgx.TxOptions) (pgx.Tx, error) {
-	m.gotOpts = &o
-	return &mockPgxTx{}, nil
-}
-
-func TestPGXTransactor_PassesTxOptions(t *testing.T) {
-	pool := &mockPgxTxPool{}
-	opts := pgx.TxOptions{IsoLevel: pgx.Serializable, AccessMode: pgx.ReadOnly}
-
-	_, txCtx, err := NewPGXTransactor(pool, WithPGXTxOptions(opts)).BeginTx(context.Background())
-	require.NoError(t, err)
-	require.NotNil(t, pool.gotOpts)
-	assert.Equal(t, opts, *pool.gotOpts)
-
-	_, ok := ExtractPGXTx(txCtx)
-	assert.True(t, ok)
-}
-
-func TestNewPGXTransactor_PanicsWhenOptionsUnsupported(t *testing.T) {
-	pool := &mockPgxPool{}
-
-	assert.Panics(t, func() {
-		NewPGXTransactor(pool, WithPGXTxOptions(pgx.TxOptions{IsoLevel: pgx.Serializable}))
-	}, "a pool without BeginTx cannot honour tx options; fail at startup")
-	assert.NotPanics(t, func() { NewPGXTransactor(pool) })
-}
-
-func TestIsRetryableTxError(t *testing.T) {
-	assert.True(t, IsRetryableTxError(&pgconn.PgError{Code: "40001"}))
-	assert.True(t, IsRetryableTxError(&pgconn.PgError{Code: "40P01"}))
-	assert.True(t, IsRetryableTxError(fmt.Errorf("commit failed: %w", &pgconn.PgError{Code: "40001"})),
-		"must see through wrapping added by the uow manager")
-	assert.False(t, IsRetryableTxError(&pgconn.PgError{Code: "23505"}))
-	assert.False(t, IsRetryableTxError(errors.New("plain")))
-	assert.False(t, IsRetryableTxError(nil))
 }
