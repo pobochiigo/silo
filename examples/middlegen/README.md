@@ -23,7 +23,7 @@ go run ./middlegen
 | `RotateKey` | `//middlegen:redact key` | Logged as `key=[REDACTED]`. |
 | `Decrement` | none | Basic-typed results are never echoed: returns `0` while queued. |
 | `io.Closer` | none | No context: logged and measured, not traced or deferred. |
-| `Service.Reserve` | `//middlegen:in-tx` | Wrapped in `RunInTx`: `BEGIN` first, the read runs inside the transaction, the queued write runs before `COMMIT`. |
+| `Service.Reserve` | `//middlegen:in-tx` | Runs as one task through `RunInTx`: `BEGIN` first, the read inside the transaction, the write executes at once, then `COMMIT`. |
 
 `Service` is decorated from `inventory/svcmw`, a separate package, with
 `-dir=middlegen/inventory`: the generated code imports `inventory` and refers
@@ -45,22 +45,24 @@ level=DEBUG msg="Save started" service=inventory item="&{SKU:widget Name:widget 
 ```
 
 Step 2, `RunInTx` through `//middlegen:in-tx`: `BEGIN` comes first, the read
-runs inside the transaction, and the queued write still runs after the
-method body, just before `COMMIT`. Same single write phase, different
-snapshot for the read.
+runs inside the transaction, and the write executes the moment it is called.
+A task carries no unit of work, so there is nothing to queue on: the
+`Save executed` line appears before the `Save` span ends.
 
 ```
 level=DEBUG msg="Reserve started" service=inventory sku=widget qty=3
    [tx] BEGIN
 level=DEBUG msg="Get started" service=inventory sku=widget
+   [span] inventory.Get               2µs  ok
 level=DEBUG msg="Save started" service=inventory item="&{SKU:widget Name:widget Quantity:10 Reserved:3}"
-   [span] inventory.Save              4µs  ok
    [repo] Save executed: widget quantity=10 reserved=3
+   [span] inventory.Save              8µs  ok
    [tx] COMMIT
+   [span] inventory.Reserve          23µs  ok
 ```
 
 Step 4 queues five writes in one `RunWith` and prints what each returned
-before the transaction opens; step 5 fails inside `RunInTx` and shows the
+before the transaction opens; step 5 fails inside a `RunInTx` task and shows the
 `ROLLBACK`, the span marked with the error and the `Reserve failed` log line.
 Step 7 prints the instruments the metrics middleware created:
 

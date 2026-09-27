@@ -105,7 +105,7 @@ func main() {
 	}
 	fmt.Printf("   alice opened with %d; the *Account the service returned is the one it passed in\n", alice.Balance)
 
-	demo.Step(2, "Transfer runs in RunInTx: the balance check and the writes share one transaction, an error rolls it back")
+	demo.Step(2, "Transfer runs in RunWith with the check in the write: the debit statement refuses an overdraft, the unit of work rolls back, nothing is written")
 	err = svc.Transfer(ctx, "alice", "bob", 1_000_000)
 	fmt.Printf("   transfer of 1000000 -> %v\n", err)
 	if !errors.Is(err, ledger.ErrInsufficientFunds) {
@@ -153,26 +153,44 @@ func main() {
 		demo.Fail("invariants", errors.New("the ledger is inconsistent"))
 	}
 
-	demo.Step(5, "Nesting: RunInTx refuses to join a RunWith action, but joins an outer RunInTx")
-	err = manager.RunWith(ctx, func(ctx context.Context) error {
-		return svc.Transfer(ctx, "alice", "bob", 1) // //middlegen:in-tx inside a RunWith action
-	})
-	fmt.Printf("   inside RunWith: %v\n", err)
-	if !errors.Is(err, uow.ErrNoTransaction) {
-		demo.Fail("expected ErrNoTransaction", err)
+	demo.Step(5, "ApplyInterest runs as one task (//middlegen:in-tx): BEGIN first, ListAccounts inside the transaction, the writes execute at once, then COMMIT")
+	before := balances(ctx, svc)
+	if err := svc.ApplyInterest(ctx, 100); err != nil {
+		demo.Fail("apply interest", err)
 	}
-	err = manager.RunInTx(ctx, func(ctx context.Context) error {
-		if err := svc.Transfer(ctx, "alice", "bob", 1); err != nil {
+	printBalances(ctx, svc)
+	expectInterest(ctx, svc, before, 100)
+
+	demo.Step(6, "Nesting: an in-tx method called inside RunWith is queued and runs with that boundary's transaction; inside a task it runs at once")
+	before = balances(ctx, svc)
+	err = manager.RunWith(ctx, func(ctx context.Context) error {
+		if err := svc.ApplyInterest(ctx, 100); err != nil { // queued on the RunWith unit of work
 			return err
 		}
-		return svc.Transfer(ctx, "bob", "alice", 1) // same transaction, committed by the outer RunInTx
+		acc, err := repo.GetAccount(ctx, "alice") // a read on the pool: the task has not run yet
+		if err != nil {
+			return err
+		}
+		fmt.Printf("   inside the RunWith action, after the call: alice %d (unchanged, the task is queued)\n", acc.Balance)
+		return nil
 	})
-	fmt.Printf("   inside RunInTx: %v\n", err)
 	if err != nil {
-		demo.Fail("nested RunInTx", err)
+		demo.Fail("in-tx inside RunWith", err)
 	}
+	fmt.Printf("   after the boundary committed:                alice %d\n", balances(ctx, svc)["alice"])
+	expectInterest(ctx, svc, before, 100)
 
-	demo.Step(6, "Statement is a read-only RunWith: nothing deferred, no transaction opened")
+	before = balances(ctx, svc)
+	err = manager.RunInTx(ctx, func(txCtx context.Context) error {
+		return svc.ApplyInterest(txCtx, 100) // inside a task: runs now, in the open transaction
+	})
+	if err != nil {
+		demo.Fail("in-tx inside RunInTx", err)
+	}
+	fmt.Printf("   inside a RunInTx task: ran at once, alice %d\n", balances(ctx, svc)["alice"])
+	expectInterest(ctx, svc, before, 100)
+
+	demo.Step(7, "Statement is a read-only RunWith: nothing deferred, no transaction opened")
 	acc, latest, err := svc.Statement(ctx, "alice")
 	if err != nil {
 		demo.Fail("statement", err)
@@ -195,6 +213,29 @@ func printBalances(ctx context.Context, svc ledger.Service) int64 {
 		total += acc.Balance
 	}
 	return total
+}
+
+// balances reads both accounts through the service.
+func balances(ctx context.Context, svc ledger.Service) map[string]int64 {
+	out := map[string]int64{}
+	for _, id := range []string{"alice", "bob"} {
+		acc, _, err := svc.Statement(ctx, id)
+		if err != nil {
+			demo.Fail("statement "+id, err)
+		}
+		out[id] = acc.Balance
+	}
+	return out
+}
+
+// expectInterest checks that every balance grew by rateBps of its value in
+// before, the way ApplyInterest computes it.
+func expectInterest(ctx context.Context, svc ledger.Service, before map[string]int64, rateBps int64) {
+	for id, got := range balances(ctx, svc) {
+		if want := before[id] + before[id]*rateBps/10_000; got != want {
+			demo.Fail("interest", fmt.Errorf("%s holds %d after interest, want %d", id, got, want))
+		}
+	}
 }
 
 // open connects with the requested driver family and returns the pieces that

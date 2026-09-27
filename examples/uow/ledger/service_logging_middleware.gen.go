@@ -38,6 +38,15 @@ func (l *serviceLoggingService) Transfer(ctx context.Context, from string, to st
 	return err
 }
 
+func (l *serviceLoggingService) ApplyInterest(ctx context.Context, rateBps int64) error {
+	l.logger.DebugContext(ctx, "ApplyInterest started", slog.Any("rateBps", rateBps))
+	err := l.next.ApplyInterest(ctx, rateBps)
+	if err != nil {
+		l.logger.ErrorContext(ctx, "ApplyInterest failed", slog.Any("error", err))
+	}
+	return err
+}
+
 func (l *serviceLoggingService) Statement(ctx context.Context, id string) (*Account, []Entry, error) {
 	l.logger.DebugContext(ctx, "Statement started", slog.Any("id", id))
 	r0, r1, err := l.next.Statement(ctx, id)

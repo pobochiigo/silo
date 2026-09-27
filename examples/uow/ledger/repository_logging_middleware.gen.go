@@ -29,6 +29,15 @@ func (l *repositoryLoggingService) GetAccount(ctx context.Context, id string) (*
 	return r0, err
 }
 
+func (l *repositoryLoggingService) ListAccounts(ctx context.Context) ([]Account, error) {
+	l.logger.DebugContext(ctx, "ListAccounts started")
+	r0, err := l.next.ListAccounts(ctx)
+	if err != nil {
+		l.logger.ErrorContext(ctx, "ListAccounts failed", slog.Any("error", err))
+	}
+	return r0, err
+}
+
 func (l *repositoryLoggingService) ListEntries(ctx context.Context, accountID string, limit int) ([]Entry, error) {
 	l.logger.DebugContext(ctx, "ListEntries started", slog.Any("accountID", accountID), slog.Any("limit", limit))
 	r0, err := l.next.ListEntries(ctx, accountID, limit)

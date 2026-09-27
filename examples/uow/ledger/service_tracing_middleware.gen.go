@@ -44,6 +44,17 @@ func (t *serviceTracingService) Transfer(ctx context.Context, from string, to st
 	return err
 }
 
+func (t *serviceTracingService) ApplyInterest(ctx context.Context, rateBps int64) error {
+	ctx, span := t.tracer.Start(ctx, "ledger.ApplyInterest", trace.WithSpanKind(trace.SpanKindInternal))
+	defer span.End()
+	err := t.next.ApplyInterest(ctx, rateBps)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	return err
+}
+
 func (t *serviceTracingService) Statement(ctx context.Context, id string) (*Account, []Entry, error) {
 	ctx, span := t.tracer.Start(ctx, "ledger.Statement", trace.WithSpanKind(trace.SpanKindInternal))
 	defer span.End()

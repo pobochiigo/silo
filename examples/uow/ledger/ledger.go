@@ -47,15 +47,18 @@ type Entry struct {
 //
 //go:generate go tool middlegen -type=Repository -kinds=uow_repo,logging,tracing,metrics -service=ledger
 type Repository interface {
-	// Reads always run immediately: on the pool inside RunWith, inside the
-	// transaction within RunInTx.
+	// Reads always run immediately: on the pool inside a RunWith action,
+	// inside the transaction within a task.
 	//middlegen:non-transactional
 	GetAccount(ctx context.Context, id string) (*Account, error)
 	//middlegen:non-transactional
+	ListAccounts(ctx context.Context) ([]Account, error)
+	//middlegen:non-transactional
 	ListEntries(ctx context.Context, accountID string, limit int) ([]Entry, error)
 
-	// Writes are queued on the unit of work (the caller gets acc back) and run
-	// when the boundary's transaction commits, in RunWith and RunInTx alike.
+	// Writes are queued on the unit of work when the context carries one (the
+	// caller gets acc back) and run when the boundary's transaction commits.
+	// Inside a task there is no unit, so they execute at once.
 	//middlegen:metric counter:ledger_accounts_created_total
 	CreateAccount(ctx context.Context, acc *Account) (*Account, error)
 
@@ -64,7 +67,10 @@ type Repository interface {
 	// commits, because the same pointer is handed to the implementation.
 	AddEntry(ctx context.Context, entry *Entry) (*Entry, error)
 
-	// AdjustBalance adds delta to the balance; the database rejects negatives.
+	// AdjustBalance adds delta to the balance. The check is in the write: a
+	// debit the balance does not cover updates nothing and returns
+	// ErrInsufficientFunds, atomically, whatever the isolation level. A
+	// credit to an unknown account returns ErrNotFound.
 	//middlegen:metric attr:direction=direction(delta)
 	AdjustBalance(ctx context.Context, id string, delta int64) error
 }
@@ -79,8 +85,9 @@ func direction(delta int64) string {
 }
 
 // Service is the business contract. The uow_service middleware wraps every
-// method in a unit of work: OpenAccount and Statement in RunWith, Transfer in
-// RunInTx because it must read and write under one isolation level.
+// method in a unit of work: OpenAccount, Transfer and Statement as RunWith
+// boundaries, ApplyInterest as one RunInTx task because it reads and writes
+// every account inside the transaction.
 //
 //go:generate go tool middlegen -type=Service -kinds=uow_service,logging,tracing -service=ledger
 type Service interface {
@@ -88,11 +95,18 @@ type Service interface {
 	// writes are queued and committed together when the method returns.
 	OpenAccount(ctx context.Context, id, owner string, opening int64) (*Account, error)
 
-	// Transfer moves amount from one account to another. The balance check
-	// and the four writes share one SERIALIZABLE transaction; a serialization
-	// failure re-runs the whole method.
-	//middlegen:in-tx
+	// Transfer moves amount from one account to another. The four writes are
+	// queued and committed together; the debit carries the balance check, so
+	// an overdraft fails the unit of work and nothing is written.
 	Transfer(ctx context.Context, from, to string, amount int64) error
+
+	// ApplyInterest credits every account with rateBps basis points of its
+	// balance. The method runs as one task: the balances are read inside the
+	// transaction, the writes execute immediately, and a serialization
+	// failure re-runs the whole method. Called inside another boundary it is
+	// queued and runs with that boundary's transaction.
+	//middlegen:in-tx
+	ApplyInterest(ctx context.Context, rateBps int64) error
 
 	// Statement reads an account and its latest entries. Nothing is deferred,
 	// so no transaction is opened.

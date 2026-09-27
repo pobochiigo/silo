@@ -37,6 +37,25 @@ func (r *Repository) GetAccount(ctx context.Context, id string) (*ledger.Account
 	return &acc, nil
 }
 
+func (r *Repository) ListAccounts(ctx context.Context) ([]ledger.Account, error) {
+	rows, err := db.Executor(ctx, r.pool).QueryContext(ctx,
+		`SELECT id, owner, balance FROM accounts ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var accounts []ledger.Account
+	for rows.Next() {
+		var acc ledger.Account
+		if err := rows.Scan(&acc.ID, &acc.Owner, &acc.Balance); err != nil {
+			return nil, err
+		}
+		accounts = append(accounts, acc)
+	}
+	return accounts, rows.Err()
+}
+
 func (r *Repository) ListEntries(ctx context.Context, accountID string, limit int) ([]ledger.Entry, error) {
 	rows, err := db.Executor(ctx, r.pool).QueryContext(ctx,
 		`SELECT id, account_id, amount, memo, created_at FROM entries WHERE account_id = $1 ORDER BY id DESC LIMIT $2`,
@@ -78,9 +97,12 @@ func (r *Repository) AddEntry(ctx context.Context, entry *ledger.Entry) (*ledger
 	return entry, nil
 }
 
+// AdjustBalance puts the check in the write: the WHERE clause refuses a debit
+// the balance does not cover, so the row is updated or the statement is a
+// no-op, atomically, under any isolation level.
 func (r *Repository) AdjustBalance(ctx context.Context, id string, delta int64) error {
 	res, err := db.Executor(ctx, r.pool).ExecContext(ctx,
-		`UPDATE accounts SET balance = balance + $1 WHERE id = $2`, delta, id)
+		`UPDATE accounts SET balance = balance + $1 WHERE id = $2 AND balance + $1 >= 0`, delta, id)
 	if err != nil {
 		return err
 	}
@@ -89,7 +111,17 @@ func (r *Repository) AdjustBalance(ctx context.Context, id string, delta int64) 
 		return err
 	}
 	if n == 0 {
-		return ledger.ErrNotFound
+		return shortOrMissing(delta)
 	}
 	return nil
+}
+
+// shortOrMissing interprets an update that touched no row: a debit means the
+// balance was short (the service verified the account exists); a credit can
+// only miss because the account does not exist.
+func shortOrMissing(delta int64) error {
+	if delta < 0 {
+		return ledger.ErrInsufficientFunds
+	}
+	return ledger.ErrNotFound
 }
