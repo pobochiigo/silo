@@ -34,8 +34,14 @@ func (m *serviceUoWMiddleware) OpenAccount(ctx context.Context, id string, owner
 }
 
 func (m *serviceUoWMiddleware) Transfer(ctx context.Context, from string, to string, amount int64) error {
-	return m.manager.RunInTx(ctx, func(uowCtx context.Context) error {
+	return m.manager.RunWith(ctx, func(uowCtx context.Context) error {
 		return m.next.Transfer(uowCtx, from, to, amount)
+	})
+}
+
+func (m *serviceUoWMiddleware) ApplyInterest(ctx context.Context, rateBps int64) error {
+	return m.manager.RunInTx(ctx, func(txCtx context.Context) error {
+		return m.next.ApplyInterest(txCtx, rateBps)
 	})
 }
 

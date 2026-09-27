@@ -2,6 +2,7 @@ package ledger
 
 import (
 	"context"
+	"errors"
 	"fmt"
 )
 
@@ -40,20 +41,19 @@ func (s *service) Transfer(ctx context.Context, from, to string, amount int64) e
 		return ErrSameAccount
 	}
 
-	// RunInTx: these reads run inside the transaction, and the writes below
-	// are queued and run in the same transaction before it commits, so the
-	// check and the writes are covered by one SERIALIZABLE snapshot.
-	src, err := s.repo.GetAccount(ctx, from)
-	if err != nil {
+	// Both reads run on the pool, before any transaction: they give precise
+	// not-found errors. The balance is deliberately not compared here, since
+	// it could change before the debit runs; the debit checks it atomically.
+	if _, err := s.repo.GetAccount(ctx, from); err != nil {
 		return fmt.Errorf("source %s: %w", from, err)
 	}
 	if _, err := s.repo.GetAccount(ctx, to); err != nil {
 		return fmt.Errorf("destination %s: %w", to, err)
 	}
-	if src.Balance < amount {
-		return fmt.Errorf("%w: %s holds %d, transfer needs %d", ErrInsufficientFunds, from, src.Balance, amount)
-	}
 
+	// Inside RunWith the four writes are queued; they run in one transaction
+	// after this method returns. If the debit finds the balance short it
+	// fails with ErrInsufficientFunds and the whole unit of work rolls back.
 	if err := s.repo.AdjustBalance(ctx, from, -amount); err != nil {
 		return err
 	}
@@ -63,8 +63,39 @@ func (s *service) Transfer(ctx context.Context, from, to string, amount int64) e
 	if _, err := s.repo.AddEntry(ctx, &Entry{AccountID: from, Amount: -amount, Memo: "transfer to " + to}); err != nil {
 		return err
 	}
-	_, err = s.repo.AddEntry(ctx, &Entry{AccountID: to, Amount: amount, Memo: "transfer from " + from})
+	_, err := s.repo.AddEntry(ctx, &Entry{AccountID: to, Amount: amount, Memo: "transfer from " + from})
 	return err
+}
+
+func (s *service) ApplyInterest(ctx context.Context, rateBps int64) error {
+	if rateBps <= 0 {
+		return ErrInvalidAmount
+	}
+
+	// This method is marked //middlegen:in-tx, so it runs as one task: the
+	// transaction is already open, ListAccounts reads under its isolation
+	// level, and every write below executes immediately with a real result.
+	accounts, err := s.repo.ListAccounts(ctx)
+	if err != nil {
+		return err
+	}
+	for _, acc := range accounts {
+		interest := acc.Balance * rateBps / 10_000
+		if interest == 0 {
+			continue
+		}
+		if err := s.repo.AdjustBalance(ctx, acc.ID, interest); err != nil {
+			return err
+		}
+		entry, err := s.repo.AddEntry(ctx, &Entry{AccountID: acc.ID, Amount: interest, Memo: fmt.Sprintf("interest %d bps", rateBps)})
+		if err != nil {
+			return err
+		}
+		if entry.ID == 0 {
+			return errors.New("ledger: AddEntry returned no id although it ran inside the transaction")
+		}
+	}
+	return nil
 }
 
 func (s *service) Statement(ctx context.Context, id string) (*Account, []Entry, error) {

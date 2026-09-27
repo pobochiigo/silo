@@ -44,6 +44,13 @@ func (m *repositoryMetricsService) GetAccount(ctx context.Context, id string) (*
 	return r0, err
 }
 
+func (m *repositoryMetricsService) ListAccounts(ctx context.Context) ([]Account, error) {
+	now := time.Now()
+	r0, err := m.next.ListAccounts(ctx)
+	m.recorder.Observe(ctx, "ListAccounts", now, err)
+	return r0, err
+}
+
 func (m *repositoryMetricsService) ListEntries(ctx context.Context, accountID string, limit int) ([]Entry, error) {
 	now := time.Now()
 	r0, err := m.next.ListEntries(ctx, accountID, limit)

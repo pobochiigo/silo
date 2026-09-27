@@ -22,6 +22,10 @@ func (m *repositoryUoWMiddleware) GetAccount(ctx context.Context, id string) (*A
 	return m.next.GetAccount(ctx, id)
 }
 
+func (m *repositoryUoWMiddleware) ListAccounts(ctx context.Context) ([]Account, error) {
+	return m.next.ListAccounts(ctx)
+}
+
 func (m *repositoryUoWMiddleware) ListEntries(ctx context.Context, accountID string, limit int) ([]Entry, error) {
 	return m.next.ListEntries(ctx, accountID, limit)
 }

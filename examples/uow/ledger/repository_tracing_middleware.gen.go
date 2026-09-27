@@ -33,6 +33,17 @@ func (t *repositoryTracingService) GetAccount(ctx context.Context, id string) (*
 	return r0, err
 }
 
+func (t *repositoryTracingService) ListAccounts(ctx context.Context) ([]Account, error) {
+	ctx, span := t.tracer.Start(ctx, "ledger.ListAccounts", trace.WithSpanKind(trace.SpanKindInternal))
+	defer span.End()
+	r0, err := t.next.ListAccounts(ctx)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	return r0, err
+}
+
 func (t *repositoryTracingService) ListEntries(ctx context.Context, accountID string, limit int) ([]Entry, error) {
 	ctx, span := t.tracer.Start(ctx, "ledger.ListEntries", trace.WithSpanKind(trace.SpanKindInternal))
 	defer span.End()

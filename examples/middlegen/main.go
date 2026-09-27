@@ -67,7 +67,7 @@ func main() {
 	}
 	fmt.Printf("   Restock returned the item it saved: %+v\n", *item)
 
-	demo.Step(2, "RunInTx (//middlegen:in-tx): BEGIN comes first, Get runs inside the transaction, the queued Save runs before COMMIT")
+	demo.Step(2, "RunInTx (//middlegen:in-tx): BEGIN comes first, Get runs inside the transaction and Save executes at once, before COMMIT")
 	if err := svc.Reserve(ctx, "widget", 3); err != nil {
 		demo.Fail("reserve", err)
 	}
@@ -107,7 +107,7 @@ func main() {
 		demo.Fail("run with", err)
 	}
 
-	demo.Step(5, "Failure inside RunInTx rolls back; the logging middleware reports it at Error level")
+	demo.Step(5, "Failure inside a RunInTx task rolls back; the logging middleware reports it at Error level")
 	err = svc.Reserve(ctx, "widget", 1000)
 	fmt.Printf("   Reserve returned: %v\n", err)
 	if !errors.Is(err, inventory.ErrInsufficientStock) {

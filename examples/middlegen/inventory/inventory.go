@@ -33,8 +33,8 @@ type Reader interface {
 }
 
 // Repository is decorated with all four kinds. Reads run immediately; writes
-// are queued on the unit of work and run when its transaction commits, in
-// RunWith and RunInTx alike.
+// are queued on the unit of work and run when its transaction commits. Inside
+// a task (a RunInTx method) there is no unit of work, so they execute at once.
 //
 //go:generate go tool middlegen -type=Repository -kinds=uow_repo,logging,tracing,metrics -service=inventory
 type Repository interface {
@@ -72,15 +72,15 @@ func stockOf(item *Item) string {
 }
 
 // Service is decorated from another package (svcmw) to show the -dir flag.
-// Restock uses the deferred-write model, Reserve the transactional one.
+// Restock is a RunWith boundary; Reserve runs as one task.
 type Service interface {
 	// Restock reads the item now and queues the write; RunWith commits it
 	// after the method returns.
 	Restock(ctx context.Context, sku string, qty int) (*Item, error)
 
-	// Reserve checks and updates stock under one transaction: the read and
-	// the queued write share its isolation level, so a concurrent reservation
-	// cannot slip in between them.
+	// Reserve checks and updates stock as one task: the transaction is open
+	// before the read, the write executes at once inside it, and a concurrent
+	// reservation cannot slip in between them.
 	//middlegen:in-tx
 	Reserve(ctx context.Context, sku string, qty int) error
 

@@ -35,8 +35,8 @@ func (m *serviceUoWMiddleware) Restock(ctx context.Context, sku string, qty int)
 }
 
 func (m *serviceUoWMiddleware) Reserve(ctx context.Context, sku string, qty int) error {
-	return m.manager.RunInTx(ctx, func(uowCtx context.Context) error {
-		return m.next.Reserve(uowCtx, sku, qty)
+	return m.manager.RunInTx(ctx, func(txCtx context.Context) error {
+		return m.next.Reserve(txCtx, sku, qty)
 	})
 }
 
