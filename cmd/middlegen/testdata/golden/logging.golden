@@ -16,103 +16,105 @@ func ExampleLoggingMiddleware() middleware.Middleware[Example] {
 }
 
 type exampleLoggingService struct {
-	Example // forwards methods of embedded interfaces undecorated
+	Example // forwards methods that cannot be decorated
 	next    Example
 	logger  *slog.Logger
 }
 
-func (l *exampleLoggingService) Ping() error {
-
-	err := l.next.Ping()
-
-	return err
-
-}
-
-func (l *exampleLoggingService) Name(ctx context.Context) string {
-	l.logger.DebugContext(ctx, "Name started")
-
-	r0 := l.next.Name(ctx)
-
-	return r0
-
-}
-
-func (l *exampleLoggingService) Fire(ctx context.Context) {
-	l.logger.DebugContext(ctx, "Fire started")
-
-	l.next.Fire(ctx)
-
-}
-
-func (l *exampleLoggingService) Save(ctx context.Context, item *Item) (*Item, error) {
-	l.logger.DebugContext(ctx, "Save started", slog.Any("item", item))
-
-	r0, err := l.next.Save(ctx, item)
+func (l *exampleLoggingService) Close() error {
+	l.logger.Debug("Close started")
+	err := l.next.Close()
 	if err != nil {
-		l.logger.ErrorContext(ctx, "Save failed", slog.Any("error", err))
+		l.logger.Error("Close failed", slog.Any("error", err))
 	}
+	return err
+}
 
-	return r0, err
-
+func (l *exampleLoggingService) String() string {
+	l.logger.Debug("String started")
+	r0 := l.next.String()
+	return r0
 }
 
 func (l *exampleLoggingService) Find(ctx context.Context, id string) (*Item, error) {
 	l.logger.DebugContext(ctx, "Find started", slog.Any("id", id))
-
 	r0, err := l.next.Find(ctx, id)
 	if err != nil {
 		l.logger.ErrorContext(ctx, "Find failed", slog.Any("error", err))
 	}
-
 	return r0, err
+}
 
+func (l *exampleLoggingService) Ping() error {
+	l.logger.Debug("Ping started")
+	err := l.next.Ping()
+	if err != nil {
+		l.logger.Error("Ping failed", slog.Any("error", err))
+	}
+	return err
+}
+
+func (l *exampleLoggingService) Name(ctx context.Context) string {
+	l.logger.DebugContext(ctx, "Name started")
+	r0 := l.next.Name(ctx)
+	return r0
+}
+
+func (l *exampleLoggingService) Fire(ctx context.Context) {
+	l.logger.DebugContext(ctx, "Fire started")
+	l.next.Fire(ctx)
+}
+
+func (l *exampleLoggingService) Save(ctx context.Context, item *Item) (*Item, error) {
+	l.logger.DebugContext(ctx, "Save started", slog.Any("item", item))
+	r0, err := l.next.Save(ctx, item)
+	if err != nil {
+		l.logger.ErrorContext(ctx, "Save failed", slog.Any("error", err))
+	}
+	return r0, err
 }
 
 func (l *exampleLoggingService) Copy(ctx context.Context, src *Item, dst *Item) (*Item, error) {
 	l.logger.DebugContext(ctx, "Copy started", slog.Any("src", src), slog.Any("dst", dst))
-
 	r0, err := l.next.Copy(ctx, src, dst)
 	if err != nil {
 		l.logger.ErrorContext(ctx, "Copy failed", slog.Any("error", err))
 	}
-
 	return r0, err
-
 }
 
 func (l *exampleLoggingService) Rotate(ctx context.Context, name string, secret string) (string, bool, error) {
 	l.logger.DebugContext(ctx, "Rotate started", slog.Any("name", name), slog.String("secret", "[REDACTED]"))
-
 	r0, r1, err := l.next.Rotate(ctx, name, secret)
 	if err != nil {
 		l.logger.ErrorContext(ctx, "Rotate failed", slog.Any("error", err))
 	}
-
 	return r0, r1, err
-
 }
 
 func (l *exampleLoggingService) Materialize(ctx context.Context, tArg *Item, okArg bool) (Item, error) {
 	l.logger.DebugContext(ctx, "Materialize started", slog.Any("t", tArg), slog.Any("ok", okArg))
-
 	r0, err := l.next.Materialize(ctx, tArg, okArg)
 	if err != nil {
 		l.logger.ErrorContext(ctx, "Materialize failed", slog.Any("error", err))
 	}
-
 	return r0, err
-
 }
 
 func (l *exampleLoggingService) Schedule(ctx context.Context, at time.Time, items ...*Item) error {
 	l.logger.DebugContext(ctx, "Schedule started", slog.Any("at", at), slog.Any("items", items))
-
 	err := l.next.Schedule(ctx, at, items...)
 	if err != nil {
 		l.logger.ErrorContext(ctx, "Schedule failed", slog.Any("error", err))
 	}
-
 	return err
+}
 
+func (l *exampleLoggingService) Tag(p0 string, ctx context.Context) error {
+	l.logger.DebugContext(ctx, "Tag started", slog.Any("p0", p0))
+	err := l.next.Tag(p0, ctx)
+	if err != nil {
+		l.logger.ErrorContext(ctx, "Tag failed", slog.Any("error", err))
+	}
+	return err
 }

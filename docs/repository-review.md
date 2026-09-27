@@ -38,6 +38,7 @@ that has not happened yet. What changed per finding:
 | Tests | `SQLXTransactor`, every `XExecutor` branch, all transactor options, `IsRetryableTxError`, `RunInTx`, task-raised retries, backoff bounds, the fan-out handler, `NewResource`; golden files per template; a scaffolded module whose tests call the generated wrappers. |
 | Docs | README walkthrough compiles as written; directory tree and numbering fixed; new directives, log behaviour and telemetry configuration documented. |
 | CI | `go mod tidy` diff check, staticcheck, govulncheck, Dependabot for Go modules and Actions. |
+| Follow-up | `middlegen` now loads the package with `go/packages` and works from type information: embedded interfaces (same package, other packages, standard library, nested) are decorated with their directives; foreign types are qualified and imported from `go/types` instead of string matching; parameters named `_`, contexts in any position, and package-name collisions are handled; interfaces without context methods, without context-and-error methods, or without deferrable methods no longer produce unused imports; methods without a context are still logged and measured. Templates live in `cmd/middlegen/templates/*.go.tmpl` and the generator is split into `generator.go`, `method.go`, `imports.go`, `directives.go`, `names.go` and `templates.go`. |
 
 ## Verdict
 

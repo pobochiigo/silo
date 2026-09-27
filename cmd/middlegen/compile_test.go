@@ -75,17 +75,29 @@ const repoSrc = `package repo
 import (
 	"bufio"
 	"context"
+	"database/sql/driver"
 	"io"
 	"time"
 )
 
 type Thing struct{ ID string }
 
+// Base is embedded by Repo; its directive must apply to the promoted method.
+type Base interface {
+	//middlegen:non-transactional
+	Exists(ctx context.Context, id string) (bool, error)
+}
+
 type Repo interface {
-	io.Closer // embedded interfaces are skipped, not wrapped
+	io.Closer     // standard library embedded interface
+	driver.Valuer // embedded method with a type from another package
+	Base          // same-package embedded interface
 
 	// no context, returns error
 	Ping() error
+
+	// blank parameter name, context not in first position
+	Tag(_ string, ctx context.Context) error
 
 	// context, single non-error result
 	Name(ctx context.Context) string
@@ -142,6 +154,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql/driver"
 	"log/slog"
 	"strings"
 	"testing"
@@ -153,11 +166,15 @@ import (
 type spy struct {
 	calls map[string]int
 	flag  bool
+	tag   string
 }
 
 func newSpy() *spy { return &spy{calls: map[string]int{}} }
 
-func (s *spy) Close() error                                  { return nil }
+func (s *spy) Close() error                                  { s.calls["Close"]++; return nil }
+func (s *spy) Value() (driver.Value, error)                  { s.calls["Value"]++; return "v", nil }
+func (s *spy) Exists(context.Context, string) (bool, error)  { s.calls["Exists"]++; return true, nil }
+func (s *spy) Tag(tag string, _ context.Context) error       { s.calls["Tag"]++; s.tag = tag; return nil }
 func (s *spy) Ping() error                                   { s.calls["Ping"]++; return nil }
 func (s *spy) Name(context.Context) string                   { s.calls["Name"]++; return "spy" }
 func (s *spy) Touch(context.Context)                         { s.calls["Touch"]++ }
@@ -203,7 +220,16 @@ func TestDeferredCallForwardsArguments(t *testing.T) {
 		if err := r.SetFlag(ctx, true); err != nil {
 			return err
 		}
-		return r.SetFlag(ctx, false)
+		if err := r.SetFlag(ctx, false); err != nil {
+			return err
+		}
+		if err := r.Tag("later", ctx); err != nil {
+			return err
+		}
+		if s.calls["Tag"] != 0 {
+			t.Fatal("Tag: a context in second position must still defer the call")
+		}
+		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -213,6 +239,42 @@ func TestDeferredCallForwardsArguments(t *testing.T) {
 	}
 	if s.flag != false {
 		t.Fatalf("last SetFlag received ok=%v, want false (the ok local must not shadow the parameter)", s.flag)
+	}
+	if s.calls["Tag"] != 1 || s.tag != "later" {
+		t.Fatalf("Tag forwarded %q after %d calls, want \"later\" once", s.tag, s.calls["Tag"])
+	}
+}
+
+func TestEmbeddedInterfacesAreDecorated(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(prev)
+
+	s := newSpy()
+	var r Repo = RepoLoggingMiddleware()(RepoUoWMiddleware()(s))
+	ctx := uow.Inject(context.Background(), uow.NewUnitOfWork())
+
+	// Promoted from io.Closer and driver.Valuer: decorated, not just forwarded.
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := r.Value(); err != nil || v != "v" {
+		t.Fatalf("Value: got (%v, %v)", v, err)
+	}
+	// Promoted from Base with its non-transactional directive: runs immediately.
+	if ok, err := r.Exists(ctx, "id"); err != nil || !ok {
+		t.Fatalf("Exists: got (%v, %v), want immediate execution", ok, err)
+	}
+	if s.calls["Close"] != 1 || s.calls["Value"] != 1 || s.calls["Exists"] != 1 {
+		t.Fatalf("unexpected calls: %v", s.calls)
+	}
+
+	out := buf.String()
+	for _, want := range []string{"Close started", "Value started", "Exists started"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in logs:\n%s", want, out)
+		}
 	}
 }
 

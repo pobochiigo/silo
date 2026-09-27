@@ -18,116 +18,112 @@ func ExampleTracingMiddleware() middleware.Middleware[Example] {
 }
 
 type exampleTracingService struct {
-	Example // forwards methods of embedded interfaces undecorated
+	Example // forwards methods that cannot be decorated
 	next    Example
 	tracer  trace.Tracer
 }
 
-func (t *exampleTracingService) Ping() error {
-	err := t.next.Ping()
-
+func (t *exampleTracingService) Close() error {
+	err := t.next.Close()
 	return err
-
 }
 
-func (t *exampleTracingService) Name(ctx context.Context) string {
-	ctx, span := t.tracer.Start(ctx, "example.Name", trace.WithSpanKind(trace.SpanKindInternal))
-	defer span.End()
-
-	r0 := t.next.Name(ctx)
-
+func (t *exampleTracingService) String() string {
+	r0 := t.next.String()
 	return r0
-
-}
-
-func (t *exampleTracingService) Fire(ctx context.Context) {
-	ctx, span := t.tracer.Start(ctx, "example.Fire", trace.WithSpanKind(trace.SpanKindInternal))
-	defer span.End()
-
-	t.next.Fire(ctx)
-
-}
-
-func (t *exampleTracingService) Save(ctx context.Context, item *Item) (*Item, error) {
-	ctx, span := t.tracer.Start(ctx, "example.Save", trace.WithSpanKind(trace.SpanKindInternal))
-	defer span.End()
-
-	r0, err := t.next.Save(ctx, item)
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-	}
-
-	return r0, err
-
 }
 
 func (t *exampleTracingService) Find(ctx context.Context, id string) (*Item, error) {
 	ctx, span := t.tracer.Start(ctx, "example.Find", trace.WithSpanKind(trace.SpanKindInternal))
 	defer span.End()
-
 	r0, err := t.next.Find(ctx, id)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 	}
-
 	return r0, err
+}
 
+func (t *exampleTracingService) Ping() error {
+	err := t.next.Ping()
+	return err
+}
+
+func (t *exampleTracingService) Name(ctx context.Context) string {
+	ctx, span := t.tracer.Start(ctx, "example.Name", trace.WithSpanKind(trace.SpanKindInternal))
+	defer span.End()
+	r0 := t.next.Name(ctx)
+	return r0
+}
+
+func (t *exampleTracingService) Fire(ctx context.Context) {
+	ctx, span := t.tracer.Start(ctx, "example.Fire", trace.WithSpanKind(trace.SpanKindInternal))
+	defer span.End()
+	t.next.Fire(ctx)
+}
+
+func (t *exampleTracingService) Save(ctx context.Context, item *Item) (*Item, error) {
+	ctx, span := t.tracer.Start(ctx, "example.Save", trace.WithSpanKind(trace.SpanKindInternal))
+	defer span.End()
+	r0, err := t.next.Save(ctx, item)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	return r0, err
 }
 
 func (t *exampleTracingService) Copy(ctx context.Context, src *Item, dst *Item) (*Item, error) {
 	ctx, span := t.tracer.Start(ctx, "example.Copy", trace.WithSpanKind(trace.SpanKindInternal))
 	defer span.End()
-
 	r0, err := t.next.Copy(ctx, src, dst)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 	}
-
 	return r0, err
-
 }
 
 func (t *exampleTracingService) Rotate(ctx context.Context, name string, secret string) (string, bool, error) {
 	ctx, span := t.tracer.Start(ctx, "example.Rotate", trace.WithSpanKind(trace.SpanKindInternal))
 	defer span.End()
-
 	r0, r1, err := t.next.Rotate(ctx, name, secret)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 	}
-
 	return r0, r1, err
-
 }
 
 func (t *exampleTracingService) Materialize(ctx context.Context, tArg *Item, okArg bool) (Item, error) {
 	ctx, span := t.tracer.Start(ctx, "example.Materialize", trace.WithSpanKind(trace.SpanKindInternal))
 	defer span.End()
-
 	r0, err := t.next.Materialize(ctx, tArg, okArg)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 	}
-
 	return r0, err
-
 }
 
 func (t *exampleTracingService) Schedule(ctx context.Context, at time.Time, items ...*Item) error {
 	ctx, span := t.tracer.Start(ctx, "example.Schedule", trace.WithSpanKind(trace.SpanKindInternal))
 	defer span.End()
-
 	err := t.next.Schedule(ctx, at, items...)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 	}
-
 	return err
+}
 
+func (t *exampleTracingService) Tag(p0 string, ctx context.Context) error {
+	ctx, span := t.tracer.Start(ctx, "example.Tag", trace.WithSpanKind(trace.SpanKindInternal))
+	defer span.End()
+	err := t.next.Tag(p0, ctx)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	return err
 }
