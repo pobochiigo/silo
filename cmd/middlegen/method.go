@@ -33,7 +33,8 @@ type Method struct {
 	HasContext       bool
 	HasError         bool
 	NonTransactional bool
-	// InTx marks a service method that runs in Manager.RunInTx instead of RunWith.
+	// InTx marks a service method that runs as one task through
+	// Manager.RunInTx instead of as a RunWith boundary.
 	InTx                bool
 	ParamsSignature     string
 	ParamsNames         string
@@ -145,6 +146,11 @@ func (g *generator) buildMethod(fn *types.Func, ifaceName string) (Method, error
 	if n := len(m.Results); n > 0 && m.Results[n-1].IsError {
 		m.Results[n-1].Name = "err"
 		m.HasError = true
+	}
+	if m.InTx && !(m.HasContext && len(m.Results) == 1 && m.HasError) {
+		// Called inside another boundary the method is queued and returns
+		// before its body runs, so it cannot promise results.
+		return Method{}, fmt.Errorf("%s.%s: //%s:in-tx needs a context parameter and error as the only result", ifaceName, fn.Name(), g.opts.Prefix)
 	}
 
 	// Metric attribute expressions were written against the original

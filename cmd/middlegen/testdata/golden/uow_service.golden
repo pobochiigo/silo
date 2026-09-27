@@ -136,7 +136,7 @@ func (m *exampleUoWMiddleware) Tag(p0 string, ctx context.Context) error {
 }
 
 func (m *exampleUoWMiddleware) Transfer(ctx context.Context, from string, to string, amount int64) error {
-	return m.manager.RunInTx(ctx, func(uowCtx context.Context) error {
-		return m.next.Transfer(uowCtx, from, to, amount)
+	return m.manager.RunInTx(ctx, func(txCtx context.Context) error {
+		return m.next.Transfer(txCtx, from, to, amount)
 	})
 }

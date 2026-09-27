@@ -25,8 +25,12 @@ type {{.InterfaceNameLower}}UoWMiddleware struct {
 func (m *{{$.InterfaceNameLower}}UoWMiddleware) {{.Name}}({{.ParamsSignature}}) {{.ResultsSignature}} {
 {{- if not .HasContext}}
 	{{if .Results}}return {{end}}m.next.{{.Name}}({{.ParamsNames}})
+{{- else if .InTx}}
+	return m.manager.RunInTx(ctx, func(txCtx context.Context) error {
+		return m.next.{{.Name}}({{.ParamsNamesWithTx}})
+	})
 {{- else if and (eq (len .Results) 1) .HasError}}
-	return m.manager.{{if .InTx}}RunInTx{{else}}RunWith{{end}}(ctx, func(uowCtx context.Context) error {
+	return m.manager.RunWith(ctx, func(uowCtx context.Context) error {
 		return m.next.{{.Name}}({{.ParamsNamesWithUow}})
 	})
 {{- else if and .Results .HasError}}
@@ -38,7 +42,7 @@ func (m *{{$.InterfaceNameLower}}UoWMiddleware) {{.Name}}({{.ParamsSignature}}) 
 {{- end}}
 		err error
 	)
-	err = m.manager.{{if .InTx}}RunInTx{{else}}RunWith{{end}}(ctx, func(uowCtx context.Context) error {
+	err = m.manager.RunWith(ctx, func(uowCtx context.Context) error {
 		var innerErr error
 		{{.NonErrorResultsVars}}, innerErr = m.next.{{.Name}}({{.ParamsNamesWithUow}})
 		return innerErr
@@ -51,7 +55,7 @@ func (m *{{$.InterfaceNameLower}}UoWMiddleware) {{.Name}}({{.ParamsSignature}}) 
 {{- end}}
 	)
 	// {{.Name}} cannot return an error, so a failed Unit of Work is logged instead.
-	if err := m.manager.{{if .InTx}}RunInTx{{else}}RunWith{{end}}(ctx, func(uowCtx context.Context) error {
+	if err := m.manager.RunWith(ctx, func(uowCtx context.Context) error {
 		{{.ResultsVars}} = m.next.{{.Name}}({{.ParamsNamesWithUow}})
 		return nil
 	}); err != nil {
@@ -60,7 +64,7 @@ func (m *{{$.InterfaceNameLower}}UoWMiddleware) {{.Name}}({{.ParamsSignature}}) 
 	return {{.ResultsVars}}
 {{- else}}
 	// {{.Name}} cannot return an error, so a failed Unit of Work is logged instead.
-	if err := m.manager.{{if .InTx}}RunInTx{{else}}RunWith{{end}}(ctx, func(uowCtx context.Context) error {
+	if err := m.manager.RunWith(ctx, func(uowCtx context.Context) error {
 		m.next.{{.Name}}({{.ParamsNamesWithUow}})
 		return nil
 	}); err != nil {

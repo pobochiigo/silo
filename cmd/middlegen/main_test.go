@@ -320,9 +320,16 @@ func TestRunValidation(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/g\n\ngo 1.26.0\n"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "g.go"), []byte(`package g
 
+import "context"
+
 type Store[T any] interface{ Get() T }
 
 type Plain struct{}
+
+type Svc interface {
+	//middlegen:in-tx
+	Lookup(ctx context.Context, id string) (string, error)
+}
 `), 0o600))
 
 	err := run(dir, options{TypeName: "Store", Kinds: []string{"logging"}})
@@ -342,6 +349,9 @@ type Plain struct{}
 
 	err = run(dir, options{Kinds: []string{"logging"}})
 	assert.ErrorContains(t, err, "-type flag is required")
+
+	err = run(dir, options{TypeName: "Svc", Kinds: []string{"uow_service"}})
+	assert.ErrorContains(t, err, "in-tx needs a context parameter and error as the only result")
 }
 
 // TestGolden renders every template for the interface in
