@@ -1,13 +1,24 @@
+// Package db adapts database/sql, sqlx and pgx transactions to the uow
+// package's Transactor contract and resolves the active transaction from a
+// context.
+//
+// The package assumes one database per context: it stores the active
+// standard/sqlx transaction under a single context key and the active pgx
+// transaction under another, and the Executor helpers hand whatever is there
+// to any repository that asks. Applications that talk to several databases
+// must not nest Unit of Work boundaries that belong to different databases.
 package db
 
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jmoiron/sqlx"
+	"github.com/jmoiron/sqlx/reflectx"
 
 	"github.com/pobochiigo/silo/uow"
 )
@@ -30,7 +41,8 @@ type SQLXCommon interface {
 
 type txKey struct{}
 
-// InjectTx injects the transactional executor into the context.
+// InjectTx injects the transactional executor into the context. A context
+// holds at most one executor; injecting a second one replaces the first.
 func InjectTx(ctx context.Context, tx SQLCommon) context.Context {
 	return context.WithValue(ctx, txKey{}, tx)
 }
@@ -52,13 +64,18 @@ func Executor(ctx context.Context, fallback SQLCommon) SQLCommon {
 // XExecutor resolves the active transactional executor in the context if present.
 // If the active executor in the context is a standard library *sql.Tx transaction,
 // it dynamically wraps it in a type-safe *sqlx.Tx wrapper inheriting name mapping
-// from the fallback connection pool at runtime.
+// from the fallback connection pool when that pool is a *sqlx.DB, and sqlx's
+// default mapper otherwise.
 //
 // Limitation of the dynamic *sql.Tx wrap: the constructed *sqlx.Tx has no driver
 // name, so bindvar-dependent helpers (NamedExecContext, Rebind, BindNamed) fall
 // back to '?' placeholders, which fails on drivers like Postgres that expect $N.
 // If repositories use named queries inside transactions, begin transactions with
 // SQLXTransactor so the genuine *sqlx.Tx is injected instead.
+//
+// XExecutor panics when the context carries an executor it cannot adapt
+// (neither a *sql.Tx nor an SQLXCommon). Falling back to the pool in that case
+// would silently run the caller's statements outside the active transaction.
 func XExecutor(ctx context.Context, fallback SQLXCommon) SQLXCommon {
 	tx, ok := ExtractTx(ctx)
 	if !ok {
@@ -66,14 +83,13 @@ func XExecutor(ctx context.Context, fallback SQLXCommon) SQLXCommon {
 	}
 
 	if stdTx, ok := tx.(*sql.Tx); ok {
-		if sqlxDB, ok := fallback.(*sqlx.DB); ok {
-			return &sqlx.Tx{
-				Tx:     stdTx,
-				Mapper: sqlxDB.Mapper,
-			}
+		mapper := reflectx.NewMapperFunc("db", sqlx.NameMapper)
+		if sqlxDB, ok := fallback.(*sqlx.DB); ok && sqlxDB.Mapper != nil {
+			mapper = sqlxDB.Mapper
 		}
 		return &sqlx.Tx{
-			Tx: stdTx,
+			Tx:     stdTx,
+			Mapper: mapper,
 		}
 	}
 
@@ -81,7 +97,7 @@ func XExecutor(ctx context.Context, fallback SQLXCommon) SQLXCommon {
 		return sqlxTx
 	}
 
-	return fallback
+	panic(fmt.Sprintf("db: executor %T found in context cannot be used with sqlx; begin transactions with SQLTransactor or SQLXTransactor", tx))
 }
 
 // stdTxAdapter wraps *sql.Tx to satisfy uow.Tx.
@@ -227,18 +243,26 @@ type PGXTransactorOption func(*PGXTransactor)
 
 // WithPGXTxOptions sets the pgx.TxOptions (isolation level, access mode) used
 // for every transaction the transactor begins. The pool passed to
-// NewPGXTransactor must also implement PGXTxBeginner.
+// NewPGXTransactor must also implement PGXTxBeginner; NewPGXTransactor
+// panics otherwise so the misconfiguration surfaces at startup.
 func WithPGXTxOptions(opts pgx.TxOptions) PGXTransactorOption {
 	return func(t *PGXTransactor) {
 		t.opts = &opts
 	}
 }
 
-// NewPGXTransactor creates a new PGXTransactor.
+// NewPGXTransactor creates a new PGXTransactor. It panics when
+// WithPGXTxOptions is used with a pool that does not implement PGXTxBeginner,
+// because every transaction the transactor begins would fail.
 func NewPGXTransactor(pool PGXBeginner, opts ...PGXTransactorOption) *PGXTransactor {
 	t := &PGXTransactor{pool: pool}
 	for _, opt := range opts {
 		opt(t)
+	}
+	if t.opts != nil {
+		if _, ok := t.pool.(PGXTxBeginner); !ok {
+			panic(fmt.Sprintf("db: pool %T does not support pgx.TxOptions (missing BeginTx); drop WithPGXTxOptions or use *pgxpool.Pool", pool))
+		}
 	}
 	return t
 }
@@ -261,4 +285,26 @@ func (t *PGXTransactor) BeginTx(ctx context.Context) (uow.Tx, context.Context, e
 	}
 	txCtx := InjectPGXTx(ctx, tx)
 	return tx, txCtx, nil
+}
+
+// retryableSQLStates lists the PostgreSQL SQLSTATE codes that indicate a
+// transaction failed only because of concurrent activity and can be retried
+// as-is: 40001 serialization_failure and 40P01 deadlock_detected.
+var retryableSQLStates = map[string]bool{
+	"40001": true,
+	"40P01": true,
+}
+
+// IsRetryableTxError reports whether err (or any error it wraps) carries a
+// PostgreSQL SQLSTATE that marks the transaction as retryable: 40001
+// (serialization_failure) or 40P01 (deadlock_detected). It works with any
+// driver whose errors expose SQLState() string, which includes pgx
+// (*pgconn.PgError) and lib/pq (*pq.Error). Pass it to
+// uow.WithRetryEvaluator to retry serialization failures automatically.
+func IsRetryableTxError(err error) bool {
+	var stateErr interface{ SQLState() string }
+	if errors.As(err, &stateErr) {
+		return retryableSQLStates[stateErr.SQLState()]
+	}
+	return false
 }

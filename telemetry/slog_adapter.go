@@ -59,11 +59,8 @@ func (a *slogAdapter) Log(keyvals ...any) error {
 		case "level":
 			level = a.parseLogLevel(val)
 		case "err", "error":
-			if errVal, ok := val.(error); ok {
-				attrs = append(attrs, slog.Any("error", errVal))
-			} else {
-				attrs = append(attrs, slog.Any("error", val))
-			}
+			// Normalise both go-kit spellings to a single "error" attribute.
+			attrs = append(attrs, slog.Any("error", val))
 		default:
 			attrs = append(attrs, slog.Any(key, val))
 		}

@@ -391,6 +391,173 @@ func TestRunWith_ContextCancelled(t *testing.T) {
 	})
 
 	// Since we cancel inside, the retry loop will see the context done
-	assert.Error(t, err)
-	assert.True(t, errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "canceled"))
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
+func TestRunWith_TaskErrorIsRetried(t *testing.T) {
+	// Postgres reports most serialization failures from the statement that
+	// conflicts, not from COMMIT; a retryable error raised by a task must
+	// re-run the batch in a fresh transaction.
+	transient := errors.New("could not serialize access")
+	var attempts int32
+
+	transactor := &mockTransactor{}
+	m := NewManager(
+		transactor,
+		WithMaxRetries(3),
+		WithRetryEvaluator(func(err error) bool { return errors.Is(err, transient) }),
+		WithRetryDelay(time.Millisecond, time.Millisecond),
+	)
+
+	err := m.RunWith(context.Background(), func(uowCtx context.Context) error {
+		uowInst, ok := Extract(uowCtx)
+		require.True(t, ok)
+		uowInst.Defer(func(ctx context.Context) error {
+			if atomic.AddInt32(&attempts, 1) < 3 {
+				return transient
+			}
+			return nil
+		})
+		return nil
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, int32(3), atomic.LoadInt32(&attempts))
+	assert.Equal(t, int32(3), atomic.LoadInt32(&transactor.beginCalls))
+}
+
+func TestRunInTx_ActionRunsInsideTransaction(t *testing.T) {
+	type txKey struct{}
+	tx := &mockTx{}
+	transactor := &mockTransactor{
+		beginTxFunc: func(ctx context.Context) (Tx, context.Context, error) {
+			return tx, context.WithValue(ctx, txKey{}, "tx"), nil
+		},
+	}
+	m := NewManager(transactor)
+
+	var order []string
+	err := m.RunInTx(context.Background(), func(uowCtx context.Context) error {
+		// The transaction is already open and visible to the action.
+		assert.Equal(t, "tx", uowCtx.Value(txKey{}))
+		assert.Equal(t, int32(1), atomic.LoadInt32(&transactor.beginCalls))
+		order = append(order, "action")
+
+		uowInst, ok := Extract(uowCtx)
+		require.True(t, ok)
+		uowInst.Defer(func(ctx context.Context) error {
+			// Deferred tasks run in the same transaction, after the action.
+			assert.Equal(t, "tx", ctx.Value(txKey{}))
+			_, nested := Extract(ctx)
+			assert.False(t, nested, "task context must not carry the unit of work")
+			order = append(order, "task")
+			return nil
+		})
+		return nil
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"action", "task"}, order)
+	assert.Equal(t, int32(1), tx.commitCalls)
+	assert.Equal(t, int32(0), tx.rollbackCalls)
+}
+
+func TestRunInTx_ActionErrorRollsBack(t *testing.T) {
+	tx := &mockTx{}
+	transactor := &mockTransactor{
+		beginTxFunc: func(ctx context.Context) (Tx, context.Context, error) {
+			return tx, ctx, nil
+		},
+	}
+	m := NewManager(transactor)
+
+	expectedErr := errors.New("action failed")
+	err := m.RunInTx(context.Background(), func(uowCtx context.Context) error {
+		return expectedErr
+	})
+
+	assert.ErrorIs(t, err, expectedErr)
+	assert.Equal(t, int32(1), transactor.beginCalls)
+	assert.Equal(t, int32(0), tx.commitCalls)
+	assert.Equal(t, int32(1), tx.rollbackCalls)
+}
+
+func TestRunInTx_RetryRerunsWholeAction(t *testing.T) {
+	transient := errors.New("could not serialize access")
+	var actionRuns, commits int32
+
+	transactor := &mockTransactor{
+		beginTxFunc: func(ctx context.Context) (Tx, context.Context, error) {
+			return &mockTx{commitFunc: func(context.Context) error {
+				if atomic.AddInt32(&commits, 1) < 2 {
+					return transient
+				}
+				return nil
+			}}, ctx, nil
+		},
+	}
+	m := NewManager(
+		transactor,
+		WithMaxRetries(2),
+		WithRetryEvaluator(func(err error) bool { return errors.Is(err, transient) }),
+		WithRetryDelay(time.Millisecond, time.Millisecond),
+	)
+
+	err := m.RunInTx(context.Background(), func(uowCtx context.Context) error {
+		atomic.AddInt32(&actionRuns, 1)
+		return nil
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), atomic.LoadInt32(&actionRuns), "action re-runs on retry")
+	assert.Equal(t, int32(2), atomic.LoadInt32(&transactor.beginCalls))
+}
+
+func TestRunInTx_NestedJoinsOuterUnit(t *testing.T) {
+	transactor := &mockTransactor{}
+	m := NewManager(transactor)
+
+	outer := NewUnitOfWork()
+	ctx := Inject(context.Background(), outer)
+
+	err := m.RunInTx(ctx, func(uowCtx context.Context) error {
+		extracted, ok := Extract(uowCtx)
+		require.True(t, ok)
+		assert.Same(t, outer, extracted)
+		return nil
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, int32(0), transactor.beginCalls, "nested call must not open its own transaction")
+}
+
+func TestBackoff(t *testing.T) {
+	m := NewManager(&mockTransactor{}, WithRetryDelay(100*time.Millisecond, time.Second))
+
+	within := func(t *testing.T, got, expected time.Duration) {
+		t.Helper()
+		assert.GreaterOrEqual(t, got, expected*3/4, "lower jitter bound")
+		assert.LessOrEqual(t, got, expected, "jitter never exceeds the computed delay")
+	}
+
+	for i := 0; i < 50; i++ {
+		within(t, m.backoff(1), 100*time.Millisecond)
+		within(t, m.backoff(2), 200*time.Millisecond)
+		within(t, m.backoff(4), 800*time.Millisecond)
+		within(t, m.backoff(5), time.Second)   // capped
+		within(t, m.backoff(100), time.Second) // capped, no overflow
+	}
+
+	t.Run("huge max delay does not overflow", func(t *testing.T) {
+		m := NewManager(&mockTransactor{}, WithRetryDelay(time.Second, time.Duration(1<<62)))
+		got := m.backoff(200)
+		assert.Greater(t, got, time.Duration(0))
+		assert.LessOrEqual(t, got, time.Duration(1<<62))
+	})
+
+	t.Run("non-positive delays yield zero", func(t *testing.T) {
+		m := NewManager(&mockTransactor{}, WithRetryDelay(0, 0))
+		assert.Equal(t, time.Duration(0), m.backoff(3))
+	})
 }

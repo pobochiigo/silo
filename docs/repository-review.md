@@ -6,6 +6,39 @@ module, the tests, the README, and the CI workflow. All findings marked
 or running it, or by reading the relevant dependency source in the module
 cache.
 
+## Status
+
+Every finding below has been addressed on this branch. The maintainer's
+design note was kept: a deferred repository method hands the caller back the
+object it passed in, because that object is the source of truth for a write
+that has not happened yet. What changed per finding:
+
+| Finding | Resolution |
+|---|---|
+| H1 | `ok` and every package the templates reference are reserved parameter names; a behavioural test wraps a spy and asserts the forwarded value. |
+| H2 | Echo is now explicit or unambiguous: `//middlegen:echo <param>` (or `none`), otherwise the single parameter of a non-basic matching type, otherwise the zero value. Pointer dereferences are nil-guarded. Documented in the README. |
+| H3 | README section "The transaction model" states what `RunWith` covers. `Manager.RunInTx` was added for read-modify-write flows: it opens the transaction first and re-runs the whole action on retry. |
+| H4 | `uow_service` wrappers for error-less methods log the failed unit of work through `slog.Default()`; the generator warns per method. |
+| M1 | Covered by the reserved list; `time` imports used in signatures are no longer dropped. |
+| M2 | Imports are selected from the qualifiers actually used in signatures (AST selectors), with goimports-style assumed names (`yaml.v3` → `yaml`, `go-sqlmock` → `sqlmock`, `pgx/v5` → `pgx`). |
+| M3 | `WithEndpoint` is only applied when a value is set; a test proves `OTEL_EXPORTER_OTLP_ENDPOINT` is honoured. |
+| M4 | `InitLogs` installs a fan-out handler (stderr or `Config.LocalLogHandler`, plus OTLP); `Config.DisableLocalLogs` restores collector-only output. `NewFanoutHandler` is exported. |
+| M5 | `//middlegen:redact <param>` logs `[REDACTED]`; the "started" line moved to `Debug`. |
+| M6 | The dynamic `sqlx.Tx` wrapper always carries a mapper; an executor that cannot be adapted panics instead of escaping the transaction. |
+| L1 | Metric attribute expressions are rewritten to the renamed parameters; README carries a cardinality warning. |
+| L2 | Resource adds the SDK and environment detectors and the schema URL (semconv v1.41.0); the environment is emitted under both `deployment.environment.name` and `deployment.environment`. |
+| L3 | Backoff subtracts up to 25% jitter and cannot overflow. |
+| L4 | Stale skip entries removed. |
+| L5 | Duplicate branch removed. |
+| L6 | `toSnakeCase` keeps acronyms together (`GetByID` → `get_by_id`). |
+| L7 | `NewPGXTransactor` panics at construction when options cannot be honoured. |
+| L8 | Generic interfaces are rejected with a clear message. |
+| L9 | Single-database assumption documented in the `uow` and `db` package docs and the README. |
+| L10 | Header/trailer limitation documented in the README. |
+| Tests | `SQLXTransactor`, every `XExecutor` branch, all transactor options, `IsRetryableTxError`, `RunInTx`, task-raised retries, backoff bounds, the fan-out handler, `NewResource`; golden files per template; a scaffolded module whose tests call the generated wrappers. |
+| Docs | README walkthrough compiles as written; directory tree and numbering fixed; new directives, log behaviour and telemetry configuration documented. |
+| CI | `go mod tidy` diff check, staticcheck, govulncheck, Dependabot for Go modules and Actions. |
+
 ## Verdict
 
 The library is small, cleanly layered, and the baseline is healthy: `gofmt`,
