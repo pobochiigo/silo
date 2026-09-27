@@ -329,6 +329,50 @@ func TestDeferredReturnValues(t *testing.T) {
 	}
 }
 
+func TestInsideOpenTransactionWritesRunImmediately(t *testing.T) {
+	s := newSpy()
+	r := RepoUoWMiddleware()(s)
+	m := uow.NewManager(fakeTransactor{})
+
+	err := m.RunInTx(context.Background(), func(ctx context.Context) error {
+		got, err := r.Create(ctx, &Thing{ID: "a"}, "x")
+		if err != nil {
+			return err
+		}
+		if s.calls["Create"] != 1 {
+			t.Fatalf("Create called %d times inside RunInTx, want 1 (immediate)", s.calls["Create"])
+		}
+		if got == nil || got.ID != "db-a" {
+			t.Fatalf("Create returned %v, want the implementation's result, not the echoed input", got)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Deferred tasks also run with the transaction open: a decorated call
+	// made from a task executes right away instead of re-queueing.
+	s = newSpy()
+	r = RepoUoWMiddleware()(s)
+	err = m.RunWith(context.Background(), func(ctx context.Context) error {
+		u, _ := uow.Extract(ctx)
+		u.Defer(func(txCtx context.Context) error {
+			if err := r.SetFlag(txCtx, true); err != nil {
+				return err
+			}
+			if s.calls["SetFlag"] != 1 {
+				t.Fatal("SetFlag from a task must execute immediately")
+			}
+			return nil
+		})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLoggingRedaction(t *testing.T) {
 	var buf bytes.Buffer
 	prev := slog.Default()
@@ -367,6 +411,10 @@ type Service interface {
 	Fire(ctx context.Context)
 	Register(ctx context.Context, name string) (string, error)
 	Stats(ctx context.Context) (int, bool, error)
+
+	// opened as a transaction first, so reads and writes share it
+	//middlegen:in-tx
+	Transfer(ctx context.Context, from string, to string, amount int) error
 }
 `
 
@@ -399,6 +447,44 @@ func (spy) Fire(ctx context.Context) {
 }
 func (spy) Register(context.Context, string) (string, error) { return "id", nil }
 func (spy) Stats(context.Context) (int, bool, error)         { return 1, true, nil }
+func (spy) Transfer(ctx context.Context, _ string, _ string, _ int) error {
+	if !uow.InTransaction(ctx) {
+		return errors.New("Transfer ran outside a transaction")
+	}
+	return nil
+}
+
+type fakeTx struct{}
+
+func (fakeTx) Commit(context.Context) error   { return nil }
+func (fakeTx) Rollback(context.Context) error { return nil }
+
+type countingTransactor struct{ begins int }
+
+func (c *countingTransactor) BeginTx(ctx context.Context) (uow.Tx, context.Context, error) {
+	c.begins++
+	return fakeTx{}, ctx, nil
+}
+
+func TestInTxDirectiveOpensTheTransactionFirst(t *testing.T) {
+	tr := &countingTransactor{}
+	svc := ServiceUoWMiddleware(uow.NewManager(tr))(spy{})
+
+	if err := svc.Transfer(context.Background(), "a", "b", 1); err != nil {
+		t.Fatal(err)
+	}
+	if tr.begins != 1 {
+		t.Fatalf("Transfer began %d transactions, want 1 (RunInTx)", tr.begins)
+	}
+
+	// Register is a plain RunWith method: nothing deferred, no transaction.
+	if _, err := svc.Register(context.Background(), "x"); err != nil {
+		t.Fatal(err)
+	}
+	if tr.begins != 1 {
+		t.Fatalf("Register must not open a transaction when nothing is deferred, begins=%d", tr.begins)
+	}
+}
 
 type failingTransactor struct{}
 

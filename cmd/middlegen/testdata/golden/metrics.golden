@@ -123,3 +123,10 @@ func (m *exampleMetricsService) Tag(p0 string, ctx context.Context) error {
 	m.recorder.Observe(ctx, "Tag", now, err)
 	return err
 }
+
+func (m *exampleMetricsService) Transfer(ctx context.Context, from string, to string, amount int64) error {
+	now := time.Now()
+	err := m.next.Transfer(ctx, from, to, amount)
+	m.recorder.Observe(ctx, "Transfer", now, err)
+	return err
+}
