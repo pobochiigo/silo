@@ -3,7 +3,7 @@ module github.com/pobochiigo/silo/examples
 go 1.27.1
 
 require (
-	connectrpc.com/connect v1.20.0
+	connectrpc.com/connect v1.21.0
 	github.com/go-kit/kit v0.13.0
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/jmoiron/sqlx v1.4.0
