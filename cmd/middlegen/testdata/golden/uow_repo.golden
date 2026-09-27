@@ -15,8 +15,20 @@ func ExampleUoWMiddleware() middleware.Middleware[Example] {
 }
 
 type exampleUoWMiddleware struct {
-	Example // forwards methods of embedded interfaces undecorated
+	Example // forwards methods that cannot be decorated
 	next    Example
+}
+
+func (m *exampleUoWMiddleware) Close() error {
+	return m.next.Close()
+}
+
+func (m *exampleUoWMiddleware) String() string {
+	return m.next.String()
+}
+
+func (m *exampleUoWMiddleware) Find(ctx context.Context, id string) (*Item, error) {
+	return m.next.Find(ctx, id)
 }
 
 func (m *exampleUoWMiddleware) Ping() error {
@@ -54,10 +66,6 @@ func (m *exampleUoWMiddleware) Save(ctx context.Context, item *Item) (*Item, err
 		return item, nil
 	}
 	return m.next.Save(ctx, item)
-}
-
-func (m *exampleUoWMiddleware) Find(ctx context.Context, id string) (*Item, error) {
-	return m.next.Find(ctx, id)
 }
 
 func (m *exampleUoWMiddleware) Copy(ctx context.Context, src *Item, dst *Item) (*Item, error) {
@@ -105,4 +113,14 @@ func (m *exampleUoWMiddleware) Schedule(ctx context.Context, at time.Time, items
 		return nil
 	}
 	return m.next.Schedule(ctx, at, items...)
+}
+
+func (m *exampleUoWMiddleware) Tag(p0 string, ctx context.Context) error {
+	if uowInstance, ok := uow.Extract(ctx); ok {
+		uowInstance.Defer(func(txCtx context.Context) error {
+			return m.next.Tag(p0, txCtx)
+		})
+		return nil
+	}
+	return m.next.Tag(p0, ctx)
 }

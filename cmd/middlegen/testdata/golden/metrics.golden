@@ -16,115 +16,110 @@ import (
 func ExampleMetricsMiddleware() middleware.Middleware[Example] {
 	meter := otel.GetMeterProvider().Meter("example")
 	recorder := telemetry.NewMetricsRecorder(meter, "example")
-
 	savesTotalCounter, err := recorder.Meter().Int64Counter("saves_total", metric.WithDescription("Custom counter for saves_total"))
 	if err != nil {
 		otel.Handle(err)
 	}
-
 	return func(next Example) Example {
 		return &exampleMetricsService{
-			Example:  next,
-			next:     next,
-			recorder: recorder,
-
+			Example:           next,
+			next:              next,
+			recorder:          recorder,
 			savesTotalCounter: savesTotalCounter,
 		}
 	}
 }
 
 type exampleMetricsService struct {
-	Example  // forwards methods of embedded interfaces undecorated
-	next     Example
-	recorder *telemetry.MetricsRecorder
-
+	Example           // forwards methods that cannot be decorated
+	next              Example
+	recorder          *telemetry.MetricsRecorder
 	savesTotalCounter metric.Int64Counter
 }
 
-func (m *exampleMetricsService) Ping() error {
-
-	err := m.next.Ping()
+func (m *exampleMetricsService) Close() error {
+	ctx := context.Background()
+	now := time.Now()
+	err := m.next.Close()
+	m.recorder.Observe(ctx, "Close", now, err)
 	return err
+}
 
+func (m *exampleMetricsService) String() string {
+	ctx := context.Background()
+	now := time.Now()
+	r0 := m.next.String()
+	m.recorder.Observe(ctx, "String", now, nil)
+	return r0
+}
+
+func (m *exampleMetricsService) Find(ctx context.Context, id string) (*Item, error) {
+	now := time.Now()
+	r0, err := m.next.Find(ctx, id)
+	m.recorder.Observe(ctx, "Find", now, err)
+	return r0, err
+}
+
+func (m *exampleMetricsService) Ping() error {
+	ctx := context.Background()
+	now := time.Now()
+	err := m.next.Ping()
+	m.recorder.Observe(ctx, "Ping", now, err)
+	return err
 }
 
 func (m *exampleMetricsService) Name(ctx context.Context) string {
 	now := time.Now()
-
 	r0 := m.next.Name(ctx)
 	m.recorder.Observe(ctx, "Name", now, nil)
-
 	return r0
-
 }
 
 func (m *exampleMetricsService) Fire(ctx context.Context) {
 	now := time.Now()
-
 	m.next.Fire(ctx)
 	m.recorder.Observe(ctx, "Fire", now, nil)
-
 }
 
 func (m *exampleMetricsService) Save(ctx context.Context, item *Item) (*Item, error) {
 	now := time.Now()
 	m.savesTotalCounter.Add(ctx, 1)
-
 	r0, err := m.next.Save(ctx, item)
-	m.recorder.Observe(ctx, "Save", now, err,
-		attribute.String("item_id", fmt.Sprintf("%v", item.ID)),
-	)
-
+	m.recorder.Observe(ctx, "Save", now, err, attribute.String("item_id", fmt.Sprintf("%v", item.ID)))
 	return r0, err
-
-}
-
-func (m *exampleMetricsService) Find(ctx context.Context, id string) (*Item, error) {
-	now := time.Now()
-
-	r0, err := m.next.Find(ctx, id)
-	m.recorder.Observe(ctx, "Find", now, err)
-
-	return r0, err
-
 }
 
 func (m *exampleMetricsService) Copy(ctx context.Context, src *Item, dst *Item) (*Item, error) {
 	now := time.Now()
-
 	r0, err := m.next.Copy(ctx, src, dst)
 	m.recorder.Observe(ctx, "Copy", now, err)
-
 	return r0, err
-
 }
 
 func (m *exampleMetricsService) Rotate(ctx context.Context, name string, secret string) (string, bool, error) {
 	now := time.Now()
-
 	r0, r1, err := m.next.Rotate(ctx, name, secret)
 	m.recorder.Observe(ctx, "Rotate", now, err)
-
 	return r0, r1, err
-
 }
 
 func (m *exampleMetricsService) Materialize(ctx context.Context, tArg *Item, okArg bool) (Item, error) {
 	now := time.Now()
-
 	r0, err := m.next.Materialize(ctx, tArg, okArg)
 	m.recorder.Observe(ctx, "Materialize", now, err)
-
 	return r0, err
-
 }
 
 func (m *exampleMetricsService) Schedule(ctx context.Context, at time.Time, items ...*Item) error {
 	now := time.Now()
-
 	err := m.next.Schedule(ctx, at, items...)
 	m.recorder.Observe(ctx, "Schedule", now, err)
-
 	return err
+}
 
+func (m *exampleMetricsService) Tag(p0 string, ctx context.Context) error {
+	now := time.Now()
+	err := m.next.Tag(p0, ctx)
+	m.recorder.Observe(ctx, "Tag", now, err)
+	return err
 }

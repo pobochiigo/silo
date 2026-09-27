@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"go/ast"
+	"go/types"
 	"os"
 	"path/filepath"
 	"testing"
@@ -56,10 +57,14 @@ func TestGetZeroValue(t *testing.T) {
 		{"*User", "nil"},
 		{"[]string", "nil"},
 		{"map[string]int", "nil"},
+		{"chan int", "nil"},
+		{"func(int) error", "nil"},
 		{"any", "nil"},
+		{"interface{}", "nil"},
 		{"string", `""`},
 		{"bool", "false"},
 		{"int", "0"},
+		{"uint64", "0"},
 		{"float32", "0.0"},
 		{"float64", "0.0"},
 		{"myPackage.CustomType", "*new(myPackage.CustomType)"},
@@ -67,33 +72,8 @@ func TestGetZeroValue(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		assert.Equal(t, tc.expected, getZeroValue(tc.input))
+		assert.Equal(t, tc.expected, getZeroValue(tc.input), tc.input)
 	}
-}
-
-func TestParseMethodComments(t *testing.T) {
-	doc := &ast.CommentGroup{
-		List: []*ast.Comment{
-			{Text: "//middlegen:metric attr:user_id = p1"},
-			{Text: "//middlegen:metric counter:my_counter"},
-		},
-	}
-	line := &ast.CommentGroup{
-		List: []*ast.Comment{
-			{Text: "//middlegen:metric attr:tenant_id = p2"},
-		},
-	}
-
-	attrs, counters := parseMethodComments(doc, line, "middlegen")
-
-	require.Len(t, attrs, 2)
-	assert.Equal(t, "user_id", attrs[0].Name)
-	assert.Equal(t, "p1", attrs[0].Type)
-	assert.Equal(t, "tenant_id", attrs[1].Name)
-	assert.Equal(t, "p2", attrs[1].Type)
-
-	require.Len(t, counters, 1)
-	assert.Equal(t, "my_counter", counters[0])
 }
 
 func TestParseDirectives(t *testing.T) {
@@ -103,15 +83,26 @@ func TestParseDirectives(t *testing.T) {
 			{Text: "//middlegen:non-transactional"},
 			{Text: "//middlegen:echo user, other"},
 			{Text: "//middlegen:redact password token"},
+			{Text: "//middlegen:metric attr:user_id = p1"},
+			{Text: "//middlegen:metric counter:my_counter"},
 			{Text: "//gen:redact ignored-other-prefix"},
 		},
 	}
+	line := &ast.CommentGroup{
+		List: []*ast.Comment{
+			{Text: "//middlegen:metric attr:tenant_id = t.ID"},
+		},
+	}
 
-	d := parseDirectives(doc, nil, "middlegen")
+	d := parseDirectives(doc, line, "middlegen")
 	assert.True(t, d.nonTransactional)
 	assert.Equal(t, []string{"user", "other"}, d.echo)
 	assert.False(t, d.echoNone)
 	assert.Equal(t, map[string]bool{"password": true, "token": true}, d.redact)
+	require.Len(t, d.attrs, 2)
+	assert.Equal(t, Field{Name: "user_id", Type: "p1"}, d.attrs[0])
+	assert.Equal(t, Field{Name: "tenant_id", Type: "t.ID"}, d.attrs[1])
+	assert.Equal(t, []string{"my_counter"}, d.counters)
 
 	none := parseDirectives(&ast.CommentGroup{List: []*ast.Comment{{Text: "//middlegen:echo none"}}}, nil, "middlegen")
 	assert.True(t, none.echoNone)
@@ -119,7 +110,7 @@ func TestParseDirectives(t *testing.T) {
 }
 
 func TestSanitizeParamName(t *testing.T) {
-	for _, reserved := range []string{"ok", "time", "uow", "slog", "err", "ctx", "r0", "r12"} {
+	for _, reserved := range []string{"ok", "time", "uow", "slog", "err", "ctx", "manager", "r0", "r12"} {
 		assert.Equal(t, reserved+"Arg", sanitizeParamName(reserved), reserved)
 	}
 	assert.Equal(t, "user", sanitizeParamName("user"))
@@ -128,7 +119,7 @@ func TestSanitizeParamName(t *testing.T) {
 
 func TestRewriteIdentifiers(t *testing.T) {
 	m := Method{Params: []Field{
-		{Name: "ctx", Label: "c", Type: "context.Context"},
+		{Name: "ctx", Label: "c", IsContext: true},
 		{Name: "tArg", Label: "t", Type: "*Thing"},
 		{Name: "user", Label: "user", Type: "string"},
 	}}
@@ -139,23 +130,55 @@ func TestRewriteIdentifiers(t *testing.T) {
 	assert.Equal(t, "tenant", m.rewriteIdentifiers("tenant"), "prefix of a longer identifier is untouched")
 }
 
-func TestAssumedImportName(t *testing.T) {
-	testCases := map[string]string{
+func TestImportSet(t *testing.T) {
+	dest := types.NewPackage("example.com/app/repo", "repo")
+	s := newImportSet(dest.Path(), map[string]string{
 		"context":                        "context",
-		"github.com/jackc/pgx/v5":        "pgx",
-		"gopkg.in/yaml.v3":               "yaml",
-		"github.com/DATA-DOG/go-sqlmock": "sqlmock",
-		"example.com/api/pb":             "pb",
-	}
-	for in, want := range testCases {
-		assert.Equal(t, want, assumedImportName(in), in)
-	}
+		"go.opentelemetry.io/otel/trace": "trace",
+	})
+
+	assert.Equal(t, "", s.qualifier(dest), "destination package needs no qualifier")
+	assert.Equal(t, "", s.qualifier(nil))
+
+	pb := types.NewPackage("example.com/app/pb", "pb")
+	assert.Equal(t, "pb", s.qualifier(pb))
+	assert.Equal(t, "pb", s.qualifier(pb), "stable across calls")
+	assert.Equal(t, "pb.Foo", s.qualifiedName(pb, "Foo"))
+	assert.Equal(t, "Foo", s.qualifiedName(dest, "Foo"))
+
+	otherPB := types.NewPackage("example.com/other/pb", "pb")
+	assert.Equal(t, "pb2", s.qualifier(otherPB), "same package name, different path")
+
+	rt := types.NewPackage("runtime/trace", "trace")
+	assert.Equal(t, "trace2", s.qualifier(rt), "names of template imports are reserved")
+
+	otelTrace := types.NewPackage("go.opentelemetry.io/otel/trace", "trace")
+	assert.Equal(t, "trace", s.qualifier(otelTrace), "same path as a template import reuses its name")
+
+	pgx := types.NewPackage("github.com/jackc/pgx/v5", "pgx")
+	assert.Equal(t, "pgx", s.qualifier(pgx))
+
+	uowPkg := types.NewPackage("example.com/x/uow", "uow")
+	assert.Equal(t, "uow2", s.qualifier(uowPkg), "reserved local identifiers are avoided")
+
+	assert.True(t, s.isName("pb2"))
+	assert.False(t, s.isName("context"), "fixed but unused imports are not qualifiers in play")
+
+	specs := s.specs(map[string]bool{"go.opentelemetry.io/otel/trace": true})
+	assert.Equal(t, []string{
+		`"example.com/app/pb"`,
+		`pb2 "example.com/other/pb"`,
+		`uow2 "example.com/x/uow"`,
+		`pgx "github.com/jackc/pgx/v5"`,
+		`trace2 "runtime/trace"`,
+	}, specs, "sorted by path, aliased when the qualifier differs from the path's last element")
 }
 
 func TestEchoStatement(t *testing.T) {
 	thing := func(params ...Field) Method {
-		return Method{Name: "M", Params: append([]Field{{Name: "ctx", Label: "ctx", Type: "context.Context"}}, params...)}
+		return Method{Name: "M", Params: append([]Field{{Name: "ctx", Label: "ctx", Type: "context.Context", IsContext: true}}, params...)}
 	}
+	errResult := Field{Name: "err", Type: "error", IsError: true}
 	noDirectives := methodDirectives{redact: map[string]bool{}}
 
 	t.Run("no results", func(t *testing.T) {
@@ -166,7 +189,7 @@ func TestEchoStatement(t *testing.T) {
 
 	t.Run("unique entity parameter is echoed", func(t *testing.T) {
 		m := thing(Field{Name: "u", Label: "u", Type: "*User"})
-		m.Results = []Field{{Name: "r0", Type: "*User"}, {Name: "err", Type: "error"}}
+		m.Results = []Field{{Name: "r0", Type: "*User"}, errResult}
 		stmt, err := m.echoStatement(noDirectives, "I", "middlegen")
 		require.NoError(t, err)
 		assert.Equal(t, "return u, nil", stmt)
@@ -174,15 +197,23 @@ func TestEchoStatement(t *testing.T) {
 
 	t.Run("basic types are never echoed", func(t *testing.T) {
 		m := thing(Field{Name: "id", Label: "id", Type: "string"})
-		m.Results = []Field{{Name: "r0", Type: "string"}, {Name: "r1", Type: "int"}, {Name: "err", Type: "error"}}
+		m.Results = []Field{{Name: "r0", Type: "string"}, {Name: "r1", Type: "int"}, errResult}
 		stmt, err := m.echoStatement(noDirectives, "I", "middlegen")
 		require.NoError(t, err)
 		assert.Equal(t, `return "", 0, nil`, stmt)
 	})
 
+	t.Run("variadic parameters are never echoed", func(t *testing.T) {
+		m := thing(Field{Name: "items", Label: "items", Type: "...*User", Variadic: true})
+		m.Results = []Field{{Name: "r0", Type: "[]*User"}, errResult}
+		stmt, err := m.echoStatement(noDirectives, "I", "middlegen")
+		require.NoError(t, err)
+		assert.Equal(t, "return nil, nil", stmt)
+	})
+
 	t.Run("dereference is nil guarded", func(t *testing.T) {
 		m := thing(Field{Name: "u", Label: "u", Type: "*User"})
-		m.Results = []Field{{Name: "r0", Type: "User"}, {Name: "err", Type: "error"}}
+		m.Results = []Field{{Name: "r0", Type: "User"}, errResult}
 		stmt, err := m.echoStatement(noDirectives, "I", "middlegen")
 		require.NoError(t, err)
 		assert.Contains(t, stmt, "var r0 User")
@@ -193,7 +224,7 @@ func TestEchoStatement(t *testing.T) {
 
 	t.Run("ambiguous candidates fall back to zero value", func(t *testing.T) {
 		m := thing(Field{Name: "a", Label: "a", Type: "*User"}, Field{Name: "b", Label: "b", Type: "*User"})
-		m.Results = []Field{{Name: "r0", Type: "*User"}, {Name: "err", Type: "error"}}
+		m.Results = []Field{{Name: "r0", Type: "*User"}, errResult}
 		stmt, err := m.echoStatement(noDirectives, "I", "middlegen")
 		require.NoError(t, err)
 		assert.Equal(t, "return nil, nil", stmt)
@@ -201,7 +232,7 @@ func TestEchoStatement(t *testing.T) {
 
 	t.Run("explicit echo picks a candidate and may take a value address", func(t *testing.T) {
 		m := thing(Field{Name: "a", Label: "a", Type: "User"}, Field{Name: "b", Label: "b", Type: "*User"})
-		m.Results = []Field{{Name: "r0", Type: "*User"}, {Name: "err", Type: "error"}}
+		m.Results = []Field{{Name: "r0", Type: "*User"}, errResult}
 		stmt, err := m.echoStatement(methodDirectives{echo: []string{"a"}}, "I", "middlegen")
 		require.NoError(t, err)
 		assert.Equal(t, "return &a, nil", stmt)
@@ -209,7 +240,7 @@ func TestEchoStatement(t *testing.T) {
 
 	t.Run("explicit echo none", func(t *testing.T) {
 		m := thing(Field{Name: "u", Label: "u", Type: "*User"})
-		m.Results = []Field{{Name: "r0", Type: "*User"}, {Name: "err", Type: "error"}}
+		m.Results = []Field{{Name: "r0", Type: "*User"}, errResult}
 		stmt, err := m.echoStatement(methodDirectives{echoNone: true}, "I", "middlegen")
 		require.NoError(t, err)
 		assert.Equal(t, "return nil, nil", stmt)
@@ -217,7 +248,7 @@ func TestEchoStatement(t *testing.T) {
 
 	t.Run("explicit echo errors", func(t *testing.T) {
 		m := thing(Field{Name: "u", Label: "u", Type: "*User"})
-		m.Results = []Field{{Name: "r0", Type: "*Order"}, {Name: "err", Type: "error"}}
+		m.Results = []Field{{Name: "r0", Type: "*Order"}, errResult}
 
 		_, err := m.echoStatement(methodDirectives{echo: []string{"missing"}}, "I", "middlegen")
 		assert.ErrorContains(t, err, `unknown parameter "missing"`)
@@ -230,69 +261,85 @@ func TestEchoStatement(t *testing.T) {
 	})
 }
 
-func TestQualifyType(t *testing.T) {
-	declared := map[string]bool{
-		"User":      true,
-		"CustomErr": true,
+func TestFinalize(t *testing.T) {
+	m := Method{
+		Name: "Save",
+		Params: []Field{
+			{Name: "ctx", Label: "ctx", Type: "context.Context", IsContext: true},
+			{Name: "tArg", Label: "t", Type: "*Thing"},
+			{Name: "secret", Label: "secret", Type: "string", Redact: true},
+			{Name: "tags", Label: "tags", Type: "...string", Variadic: true},
+		},
+		Results: []Field{
+			{Name: "r0", Type: "*Thing"},
+			{Name: "err", Type: "error", IsError: true},
+		},
+		HasContext: true,
+		HasError:   true,
 	}
+	m.finalize()
 
-	alias := "clientdb"
-
-	testCases := []struct {
-		input    string
-		expected string
-	}{
-		{"User", "clientdb.User"},
-		{"*User", "*clientdb.User"},
-		{"[]User", "[]clientdb.User"},
-		{"map[string]User", "map[string]clientdb.User"},
-		{"string", "string"},
-		{"context.Context", "context.Context"},
-	}
-
-	for _, tc := range testCases {
-		assert.Equal(t, tc.expected, qualifyType(tc.input, declared, alias))
-	}
+	assert.Equal(t, "ctx context.Context, tArg *Thing, secret string, tags ...string", m.ParamsSignature)
+	assert.Equal(t, "ctx, tArg, secret, tags...", m.ParamsNames)
+	assert.Equal(t, "txCtx, tArg, secret, tags...", m.ParamsNamesWithTx)
+	assert.Equal(t, "uowCtx, tArg, secret, tags...", m.ParamsNamesWithUow)
+	assert.Equal(t, `slog.Any("t", tArg), slog.String("secret", "[REDACTED]"), slog.Any("tags", tags)`, m.SlogAttributes)
+	assert.Equal(t, "(*Thing, error)", m.ResultsSignature)
+	assert.Equal(t, "r0, err", m.ResultsVars)
+	assert.Equal(t, "r0", m.NonErrorResultsVars)
+	assert.Equal(t, "_, err := m.next.Save(txCtx, tArg, secret, tags...)\n\t\t\treturn err", m.RepoDeferStmt)
 }
 
 func TestModuleHelpers(t *testing.T) {
-	tempDir, err := os.MkdirTemp("", "middlegen-test-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	goModContent := `module github.com/my-user/my-project
 
 go 1.22
 `
-	err = os.WriteFile(filepath.Join(tempDir, "go.mod"), []byte(goModContent), 0640)
-	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(tempDir, "go.mod"), []byte(goModContent), 0o640))
 
 	nestedDir := filepath.Join(tempDir, "pkg", "sub")
-	err = os.MkdirAll(nestedDir, 0750)
-	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(nestedDir, 0o750))
 
-	// Test findModuleRoot
 	root, err := findModuleRoot(nestedDir)
 	assert.NoError(t, err)
 	assert.Equal(t, tempDir, root)
 
-	// Test getModuleName
 	modName, err := getModuleName(tempDir)
 	assert.NoError(t, err)
 	assert.Equal(t, "github.com/my-user/my-project", modName)
 
-	// Test detectLibraryModule
-	libMod := detectLibraryModule(tempDir)
-	assert.Equal(t, "github.com/pobochiigo/silo", libMod) // falls back or checks contents
+	assert.Equal(t, "github.com/pobochiigo/silo", detectLibraryModule(tempDir), "foreign modules use the published library")
 }
 
-func TestRunRejectsGenericInterfaces(t *testing.T) {
+func TestRunValidation(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/g\n\ngo 1.26.0\n"), 0o600))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "g.go"), []byte("package g\n\ntype Store[T any] interface{ Get() T }\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "g.go"), []byte(`package g
+
+type Store[T any] interface{ Get() T }
+
+type Plain struct{}
+`), 0o600))
 
 	err := run(dir, options{TypeName: "Store", Kinds: []string{"logging"}})
 	assert.ErrorContains(t, err, "generic interfaces")
+
+	err = run(dir, options{TypeName: "Plain", Kinds: []string{"logging"}})
+	assert.ErrorContains(t, err, "is not an interface")
+
+	err = run(dir, options{TypeName: "Missing", Kinds: []string{"logging"}})
+	assert.ErrorContains(t, err, "not found")
+
+	err = run(dir, options{TypeName: "Store", Kinds: []string{"nope"}})
+	assert.ErrorContains(t, err, "unknown middleware kind")
+
+	err = run(dir, options{TypeName: "pkg.Store", Kinds: []string{"logging"}})
+	assert.ErrorContains(t, err, "bare interface name")
+
+	err = run(dir, options{Kinds: []string{"logging"}})
+	assert.ErrorContains(t, err, "-type flag is required")
 }
 
 // TestGolden renders every template for the interface in

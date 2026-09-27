@@ -352,12 +352,14 @@ Read methods must be annotated `//middlegen:non-transactional` so they execute i
 
 ### Notes on generated code
 
-- Methods of **embedded interfaces** (e.g. `io.Closer`) are forwarded to the wrapped implementation without decoration; declare methods explicitly on the target interface to decorate them.
-- Parameters whose names collide with identifiers used by the templates (`t`, `m`, `err`, `ok`, `span`, and the packages the templates import such as `time` or `uow`) are transparently renamed in the generated code; log attribute keys and `metric attr` expressions keep the original names.
+- `middlegen` type-checks the package with `go/packages`, so it needs the `go` tool and resolvable module dependencies. Type errors caused by not-yet-generated code are reported and tolerated; errors in the interface's own signatures abort generation.
+- Methods of **embedded interfaces** are decorated like any other, whether the embedded interface lives in the same package, another package of your module, a dependency, or the standard library (`io.Closer`), and however deeply the embeddings nest. Directives written on the embedded interface's methods apply wherever it is embedded. The one exception is an unexported method declared in another package: Go does not allow implementing it from outside, so it is forwarded through the embedded field and a warning names it.
+- Parameters whose names collide with identifiers used by the templates (`t`, `m`, `err`, `ok`, `span`, the packages the templates import such as `time` or `uow`, and the qualifiers of packages your signatures use) are transparently renamed in the generated code; log attribute keys and `metric attr` expressions keep the original names. Blank (`_`) and unnamed parameters become `p0`, `p1`, .... The context parameter may appear at any position.
+- Types from other packages are qualified from type information, so a package imported under an alias in your file, two packages sharing a name, or a package whose name differs from its path's last element (`pgx/v5`) are all imported correctly in the generated files.
 - The logging middleware logs the `<Method> started` line with all parameters at `Debug` level and failures at `Error` level. Redact secrets with `//middlegen:redact`.
 - A `uow_service` method that returns no `error` cannot report a failed commit; the generated wrapper logs the failure through `slog.Default()` and the generator prints a warning naming the method. Prefer returning an error.
+- Methods without a `context.Context` are still logged (without trace correlation) and measured; tracing needs a context to start a span, and Unit of Work boundaries need one to find the unit, so those wrappers forward such methods unchanged.
 - Generic interfaces (type parameters) are not supported; the generator refuses them with a clear message.
-- Imports of the interface's file are copied into the generated files only when a method signature references them.
 
 ---
 
