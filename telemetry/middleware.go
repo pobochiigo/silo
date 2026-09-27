@@ -29,17 +29,19 @@ func MetricsMiddleware(operationName string) endpoint.Middleware {
 	requestCounter, err = meter.Int64Counter(
 		"gokit_requests_total",
 		metric.WithDescription("Total number of requests processed by go-kit endpoints"),
-		metric.WithUnit("1"),
+		metric.WithUnit("{request}"),
 	)
 	if err != nil {
 		otel.Handle(err)
 	}
 
-	// 2. Initialize a Histogram for request execution latency
+	// 2. Initialize a Histogram for request execution latency, with buckets
+	// sized for seconds (the SDK defaults are sized for milliseconds).
 	latencyRecorder, err = meter.Float64Histogram(
 		"gokit_request_duration_seconds",
 		metric.WithDescription("Latency of requests processed by go-kit endpoints in seconds"),
 		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(DefaultLatencyBuckets...),
 	)
 	if err != nil {
 		otel.Handle(err)
@@ -54,16 +56,10 @@ func MetricsMiddleware(operationName string) endpoint.Middleware {
 
 			duration := time.Since(begin).Seconds()
 
-			// Determine execution status for metric labeling
-			success := "true"
-			if err != nil {
-				success = "false"
-			}
-
 			// Define the standard set of attributes (labels) for our metrics
 			attrs := metric.WithAttributes(
 				attribute.String("operation", operationName),
-				attribute.String("success", success),
+				attribute.Bool("success", err == nil),
 			)
 
 			// Record metrics safely. We pass the ctx to allow OpenTelemetry to automatically
@@ -101,7 +97,7 @@ func LoggingMiddleware(operationName string, logger *slog.Logger) endpoint.Middl
 				logger.ErrorContext(ctx, "endpoint execution failed",
 					slog.String("operation", operationName),
 					slog.Duration("duration", duration),
-					slog.String("err", err.Error()),
+					slog.Any("error", err),
 				)
 				return response, err
 			}

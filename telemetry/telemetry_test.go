@@ -11,8 +11,25 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/log/global"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 	"google.golang.org/grpc"
 )
+
+// restoreGlobals resets the slog default and the OTel global providers when
+// the test ends, so providers shut down by one test are not used by another.
+func restoreGlobals(t *testing.T) {
+	t.Helper()
+	prevSlog := slog.Default()
+	prevLogs := global.GetLoggerProvider()
+	t.Cleanup(func() {
+		slog.SetDefault(prevSlog)
+		otel.SetTracerProvider(tracenoop.NewTracerProvider())
+		otel.SetMeterProvider(metricnoop.NewMeterProvider())
+		global.SetLoggerProvider(prevLogs)
+	})
+}
 
 // countingListener counts accepted connections so a test can prove an
 // exporter actually dialled this address.
@@ -42,8 +59,7 @@ func TestInitTelemetry_EmptyEndpointHonoursEnvironment(t *testing.T) {
 	// OTLP environment variable instead of dialling an empty address.
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://"+lis.Addr().String())
 
-	prev := slog.Default()
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	restoreGlobals(t)
 
 	ctx := context.Background()
 	shutdown, err := InitTelemetry(ctx, Config{ServiceName: "env-test", Insecure: true})
@@ -123,10 +139,11 @@ func TestInitTelemetry(t *testing.T) {
 	})
 
 	t.Run("InitTelemetry success", func(t *testing.T) {
-		// InitLogs replaces the process-wide default logger; put it back so
-		// later tests in this package do not log into a shut-down provider.
+		// InitTelemetry replaces the process-wide default logger and the
+		// global providers; put them back so later tests in this package do
+		// not use shut-down providers.
+		restoreGlobals(t)
 		prev := slog.Default()
-		t.Cleanup(func() { slog.SetDefault(prev) })
 
 		shutdown, err := InitTelemetry(ctx, cfg)
 		assert.NoError(t, err)

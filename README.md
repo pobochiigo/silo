@@ -430,29 +430,50 @@ In addition to bootstrapping OpenTelemetry traces, metrics, and logs, the `telem
 | Field | Description |
 |---|---|
 | `ServiceName`, `ServiceVersion`, `Environment` | Resource attributes attached to all traces, metrics, and logs. The environment is emitted as both `deployment.environment.name` (current semantic conventions) and `deployment.environment`. Empty values are left out so `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` can fill them; non-empty values win over the environment. |
-| `Endpoint` | `host:port` of the OTLP gRPC collector (Grafana Alloy, OTel Collector, ...). When empty, the exporters use `OTEL_EXPORTER_OTLP_ENDPOINT` and then the OTLP default `localhost:4317`. |
-| `Insecure` | Disables TLS on exporter connections (plaintext gRPC). Defaults to `false` — TLS with the system certificate pool. |
+| `Endpoint` | The OTLP gRPC collector (Grafana Alloy, OTel Collector, ...) as `host:port` or a URL. A URL's scheme decides transport security (`http://` plaintext, `https://` TLS) and a missing port defaults to 4317. When set, the three exporters share **one** gRPC connection. When empty, each exporter dials on its own following `OTEL_EXPORTER_OTLP_ENDPOINT` and then the OTLP default `localhost:4317`. |
+| `Insecure` | Disables TLS on exporter connections (plaintext gRPC). Defaults to `false` — TLS with the system certificate pool. Ignored when `Endpoint` is a URL. |
+| `TLSConfig` | TLS settings for the exporter connections: a private CA in `RootCAs`, client certificates for mutual TLS. Nil uses the system pool. |
+| `Compression` | `"gzip"` to compress exports; empty for none. |
+| `DialOptions` | Extra gRPC dial options (keepalive parameters, resolvers) for the shared connection. |
 | `Headers` | Extra gRPC metadata sent with every export, e.g. collector auth tokens. |
-| `SkipSlogDefault` | Prevents `InitLogs` from replacing the process-wide `slog` default logger. |
+| `TraceSampleRatio` | Fraction of new traces to record, in `(0, 1]`; child spans follow their parent. Zero keeps the SDK default: `OTEL_TRACES_SAMPLER` if set, otherwise every trace. |
+| `MaxExportBatchSize`, `BatchTimeout` | Batching of spans and log records. Defaults: 500 items, 5 seconds. |
+| `MetricInterval` | How often metrics are pushed. Default: 30 seconds. |
+| `SkipHostDetection` | Leaves `host.name` out of the resource. |
+| `SkipSlogDefault` | Prevents `InitLogs` from replacing the process-wide `slog` default logger. The OTel logger provider is still registered globally, so `otelslog.NewHandler(name)` builds a handler on the exporter. |
 | `LocalLogHandler` | Handler that receives every record in addition to the OTLP exporter. Defaults to a text handler on stderr. |
+| `LocalLogLevel` | Minimum level of the default local handler. Defaults to Info; set `slog.LevelDebug` to see the generated middlewares' "started" lines locally. |
 | `DisableLocalLogs` | Send logs to the collector only. Note that `slog.SetDefault` also routes the standard `log` package through slog, so nothing is written locally. |
 
-The resource also carries the `telemetry.sdk.*` attributes and the semantic-conventions schema URL.
+The resource also carries the `telemetry.sdk.*` attributes, `host.name`, and the semantic-conventions schema URL. Invalid configuration (a sample ratio outside `[0, 1]`, an unknown compressor, a malformed endpoint) is rejected by `InitTelemetry` before any exporter is created.
+
+### Metrics
+
+Latency histograms created by `NewMetricsRecorder` (used by the generated metrics middlewares) and by `MetricsMiddleware` use `telemetry.DefaultLatencyBuckets`, second-scale boundaries from 5ms to 10s matching the Prometheus client defaults. The OpenTelemetry SDK's own defaults are sized for milliseconds and would put every request faster than five seconds into one bucket, making percentiles meaningless. Counters carry the unit `{request}` and histograms `s`.
 
 `InitTraces` registers the W3C `TraceContext`/`Baggage` propagators globally. Applications that skip tracing but still forward trace headers can call `telemetry.InitPropagators()` directly.
 
 ### Logs
 
-`InitLogs` installs a default `slog` logger that fans every record out to a local handler (stderr by default, or `LocalLogHandler`) **and** to the OTLP exporter through the official OTel bridge, so log lines carry the active trace and span IDs without disappearing from the machine when the collector is unreachable. `telemetry.NewFanoutHandler` is exported for building your own combinations.
+`InitLogs` installs a default `slog` logger that fans every record out to a local handler (stderr by default, or `LocalLogHandler`) **and** to the OTLP exporter through the official OTel bridge, so log lines carry the active trace and span IDs without disappearing from the machine when the collector is unreachable. `telemetry.NewFanoutHandler` is exported for building your own combinations, and the OTel logger provider is always registered globally, so a custom handler is one call away:
+
+```go
+import "go.opentelemetry.io/contrib/bridges/otelslog"
+
+handler := telemetry.NewFanoutHandler(myLocalHandler, otelslog.NewHandler("my-app"))
+slog.SetDefault(slog.New(handler))
+```
+
+Errors are logged under the `error` attribute everywhere in Silo: the go-kit middlewares, the go-kit adapter and the generated middlewares.
 
 ### Go-Kit Endpoint Middlewares
 Standard endpoint middlewares designed to wrap Go-Kit (`github.com/go-kit/kit/endpoint`) endpoints:
-- `MetricsMiddleware(operationName)`: Automatically records execution counts and latency durations via OTel metrics.
+- `MetricsMiddleware(operationName)`: Automatically records execution counts and latency durations via OTel metrics, labelled with `operation` and a boolean `success`.
 - `LoggingMiddleware(operationName, logger)`: Logs execution status, elapsed time, and errors via `slog` (TraceID-correlated).
 - `TracingMiddleware(operationName)`: Automatically creates child tracing spans around endpoint execution.
 
 ### Go-Kit Log Compatibility (`SlogAdapter`)
-Bridges the gap between legacy `go-kit/log.Logger` interfaces and modern standard `log/slog`. Route go-kit logs directly through your globally registered OTel bridge:
+Bridges the gap between legacy `go-kit/log.Logger` interfaces and modern standard `log/slog`. The go-kit `level` value becomes the slog level, `msg` the message, `err`/`error` the `error` attribute, and the conventional `ts` timestamp is dropped because slog stamps its own. Route go-kit logs directly through your globally registered OTel bridge:
 ```go
 import "github.com/pobochiigo/silo/telemetry"
 

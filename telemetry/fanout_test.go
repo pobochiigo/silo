@@ -92,4 +92,12 @@ func TestDefaultLogHandler(t *testing.T) {
 		_, isFanout := h.(*fanoutHandler)
 		assert.False(t, isFanout)
 	})
+
+	t.Run("local log level", func(t *testing.T) {
+		ctx := context.Background()
+		assert.False(t, localLogHandler(Config{}).Enabled(ctx, slog.LevelDebug), "Info by default")
+		assert.True(t, localLogHandler(Config{}).Enabled(ctx, slog.LevelInfo))
+		assert.True(t, localLogHandler(Config{LocalLogLevel: slog.LevelDebug}).Enabled(ctx, slog.LevelDebug))
+		assert.False(t, localLogHandler(Config{LocalLogLevel: slog.LevelError}).Enabled(ctx, slog.LevelWarn))
+	})
 }

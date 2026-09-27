@@ -96,9 +96,9 @@ func TestMetricsMiddleware(t *testing.T) {
 	for _, dp := range sumData.DataPoints {
 		for _, attr := range dp.Attributes.ToSlice() {
 			if attr.Key == "success" {
-				if attr.Value.AsString() == "true" {
+				if attr.Value.AsBool() {
 					successTrueVal = dp.Value
-				} else if attr.Value.AsString() == "false" {
+				} else {
 					successFalseVal = dp.Value
 				}
 			}
@@ -106,6 +106,15 @@ func TestMetricsMiddleware(t *testing.T) {
 	}
 	assert.Equal(t, int64(1), successTrueVal)
 	assert.Equal(t, int64(1), successFalseVal)
+	assert.Equal(t, "{request}", reqMetric.Unit)
+
+	// Latency buckets must be sized for seconds, not the SDK's millisecond defaults.
+	latency := metricsMap["gokit_request_duration_seconds"]
+	assert.Equal(t, "s", latency.Unit)
+	hist, ok := latency.Data.(metricdata.Histogram[float64])
+	require.True(t, ok)
+	require.NotEmpty(t, hist.DataPoints)
+	assert.Equal(t, DefaultLatencyBuckets, hist.DataPoints[0].Bounds)
 }
 
 func TestLoggingMiddleware(t *testing.T) {
@@ -152,7 +161,8 @@ func TestLoggingMiddleware(t *testing.T) {
 
 		assert.Equal(t, "endpoint execution failed", rec["msg"])
 		assert.Equal(t, "TestOp", rec["operation"])
-		assert.Equal(t, "some error", rec["err"])
+		assert.Equal(t, "some error", rec["error"], "same attribute key as the slog adapter and generated middlewares")
+		assert.NotContains(t, rec, "err")
 	})
 
 	t.Run("fallback logger", func(t *testing.T) {
