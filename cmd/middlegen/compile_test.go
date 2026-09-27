@@ -329,30 +329,34 @@ func TestDeferredReturnValues(t *testing.T) {
 	}
 }
 
-func TestInsideOpenTransactionWritesRunImmediately(t *testing.T) {
+func TestWritesAreQueuedInsideRunInTxToo(t *testing.T) {
 	s := newSpy()
 	r := RepoUoWMiddleware()(s)
 	m := uow.NewManager(fakeTransactor{})
 
+	in := &Thing{ID: "a"}
 	err := m.RunInTx(context.Background(), func(ctx context.Context) error {
-		got, err := r.Create(ctx, &Thing{ID: "a"}, "x")
+		got, err := r.Create(ctx, in, "x")
 		if err != nil {
 			return err
 		}
-		if s.calls["Create"] != 1 {
-			t.Fatalf("Create called %d times inside RunInTx, want 1 (immediate)", s.calls["Create"])
+		if s.calls["Create"] != 0 {
+			t.Fatal("Create ran during the action; writes must stay queued inside RunInTx")
 		}
-		if got == nil || got.ID != "db-a" {
-			t.Fatalf("Create returned %v, want the implementation's result, not the echoed input", got)
+		if got != in {
+			t.Fatalf("Create returned %v, want the echoed input while queued", got)
 		}
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	if s.calls["Create"] != 1 {
+		t.Fatalf("Create ran %d times after the action, want 1 (inside the same transaction)", s.calls["Create"])
+	}
 
-	// Deferred tasks also run with the transaction open: a decorated call
-	// made from a task executes right away instead of re-queueing.
+	// A deferred task runs with the transaction open and no unit of work in
+	// its context, so a decorated call made from it executes right away.
 	s = newSpy()
 	r = RepoUoWMiddleware()(s)
 	err = m.RunWith(context.Background(), func(ctx context.Context) error {

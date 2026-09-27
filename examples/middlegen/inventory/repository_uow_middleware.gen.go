@@ -31,9 +31,7 @@ func (m *repositoryUoWMiddleware) List(ctx context.Context) ([]Item, error) {
 }
 
 func (m *repositoryUoWMiddleware) Save(ctx context.Context, item *Item) (*Item, error) {
-	// Queued while the unit of work's transaction is not open yet (RunWith);
-	// executed immediately inside an open transaction (RunInTx, deferred tasks).
-	if uowInstance, ok := uow.Extract(ctx); ok && !uow.InTransaction(ctx) {
+	if uowInstance, ok := uow.Extract(ctx); ok {
 		uowInstance.Defer(func(txCtx context.Context) error {
 			_, err := m.next.Save(txCtx, item)
 			return err
@@ -44,9 +42,7 @@ func (m *repositoryUoWMiddleware) Save(ctx context.Context, item *Item) (*Item, 
 }
 
 func (m *repositoryUoWMiddleware) Merge(ctx context.Context, from *Item, into *Item) (*Item, error) {
-	// Queued while the unit of work's transaction is not open yet (RunWith);
-	// executed immediately inside an open transaction (RunInTx, deferred tasks).
-	if uowInstance, ok := uow.Extract(ctx); ok && !uow.InTransaction(ctx) {
+	if uowInstance, ok := uow.Extract(ctx); ok {
 		uowInstance.Defer(func(txCtx context.Context) error {
 			_, err := m.next.Merge(txCtx, from, into)
 			return err
@@ -57,9 +53,7 @@ func (m *repositoryUoWMiddleware) Merge(ctx context.Context, from *Item, into *I
 }
 
 func (m *repositoryUoWMiddleware) Archive(ctx context.Context, item *Item) (*Item, error) {
-	// Queued while the unit of work's transaction is not open yet (RunWith);
-	// executed immediately inside an open transaction (RunInTx, deferred tasks).
-	if uowInstance, ok := uow.Extract(ctx); ok && !uow.InTransaction(ctx) {
+	if uowInstance, ok := uow.Extract(ctx); ok {
 		uowInstance.Defer(func(txCtx context.Context) error {
 			_, err := m.next.Archive(txCtx, item)
 			return err
@@ -70,9 +64,7 @@ func (m *repositoryUoWMiddleware) Archive(ctx context.Context, item *Item) (*Ite
 }
 
 func (m *repositoryUoWMiddleware) RotateKey(ctx context.Context, sku string, key string) error {
-	// Queued while the unit of work's transaction is not open yet (RunWith);
-	// executed immediately inside an open transaction (RunInTx, deferred tasks).
-	if uowInstance, ok := uow.Extract(ctx); ok && !uow.InTransaction(ctx) {
+	if uowInstance, ok := uow.Extract(ctx); ok {
 		uowInstance.Defer(func(txCtx context.Context) error {
 			return m.next.RotateKey(txCtx, sku, key)
 		})
@@ -82,9 +74,7 @@ func (m *repositoryUoWMiddleware) RotateKey(ctx context.Context, sku string, key
 }
 
 func (m *repositoryUoWMiddleware) Decrement(ctx context.Context, sku string, qty int) (int, error) {
-	// Queued while the unit of work's transaction is not open yet (RunWith);
-	// executed immediately inside an open transaction (RunInTx, deferred tasks).
-	if uowInstance, ok := uow.Extract(ctx); ok && !uow.InTransaction(ctx) {
+	if uowInstance, ok := uow.Extract(ctx); ok {
 		uowInstance.Defer(func(txCtx context.Context) error {
 			_, err := m.next.Decrement(txCtx, sku, qty)
 			return err

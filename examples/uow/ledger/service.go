@@ -40,8 +40,9 @@ func (s *service) Transfer(ctx context.Context, from, to string, amount int64) e
 		return ErrSameAccount
 	}
 
-	// RunInTx: these reads see the transaction's snapshot, and the writes
-	// below execute right away in the same transaction.
+	// RunInTx: these reads run inside the transaction, and the writes below
+	// are queued and run in the same transaction before it commits, so the
+	// check and the writes are covered by one SERIALIZABLE snapshot.
 	src, err := s.repo.GetAccount(ctx, from)
 	if err != nil {
 		return fmt.Errorf("source %s: %w", from, err)

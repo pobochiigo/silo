@@ -32,7 +32,7 @@ func (s *service) Reserve(ctx context.Context, sku string, qty int) error {
 		return fmt.Errorf("%w: %s has %d available, %d requested", ErrInsufficientStock, sku, item.Quantity-item.Reserved, qty)
 	}
 	item.Reserved += qty
-	_, err = s.repo.Save(ctx, item) // immediate inside RunInTx
+	_, err = s.repo.Save(ctx, item) // queued; runs inside the RunInTx transaction before it commits
 	return err
 }
 

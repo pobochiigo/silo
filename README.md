@@ -108,11 +108,30 @@ The transaction, its isolation level and the retries therefore cover the deferre
 
 ### `RunInTx`: everything inside the transaction
 
-1. The transaction is opened **first**. The action runs with a context carrying both the transaction and a fresh unit of work, so repository reads and writes execute inside the transaction under its isolation level. `uow.InTransaction(ctx)` is true here, and the generated `uow_repo` middleware therefore executes writes immediately instead of queueing them: the caller gets the implementation's real results and later reads see the writes.
-2. Tasks deferred by hand through `UnitOfWork.Defer` run in the same transaction after the action returns `nil`, then the transaction is committed.
+1. The transaction is opened **first**. The action runs with a context carrying both the transaction and a fresh unit of work, so repository reads execute inside the transaction under its isolation level. Writes made through the generated `uow_repo` middleware are queued exactly as in `RunWith`.
+2. The queued writes (and any task deferred by hand) run in the same transaction after the action returns `nil`, then the transaction is committed.
 3. On a retryable error the **whole action** is re-run in a fresh transaction. The action must therefore be safe to repeat with respect to side effects outside the database.
 
-Use `RunInTx` for read-modify-write logic that must be isolated; use `RunWith` when the action is pure computation plus writes and you want to avoid holding a transaction open.
+### Choosing between them
+
+Both models queue the writes and run them in one transaction. They differ in **when that transaction opens**, and therefore in what the reads see and what a retry repeats:
+
+| | `RunWith` | `RunInTx` |
+|---|---|---|
+| Transaction opens | after the action returns, and only if something was queued | before the action runs, always |
+| Reads made by the action | on the pool, each in its own autocommit snapshot | inside the transaction, under its isolation level |
+| Writes | queued, run before the commit | queued, run before the commit (the same) |
+| Retry after a serialization failure or deadlock | re-runs the queued writes with the values they captured | re-runs the **whole action**, reads included |
+| Cost | the shortest possible transaction | the transaction stays open for the whole action |
+
+The difference matters as soon as a write depends on a read. Take a `Transfer` that reads a balance, checks it, and queues a debit, with two concurrent transfers of 8000 from an account holding 10000:
+
+- Under `RunWith` both read 10000 on the pool, both pass the check, and both debits are queued. Nothing links the check to the write, so either both commit and the balance goes to -6000, or a database constraint rejects the second with a hard error. Neither is a retry.
+- Under `RunInTx` with a SERIALIZABLE transactor, both reads happen inside their transaction. The database sees that each transaction's decision rested on a read the other one invalidated, aborts one with `SQLSTATE 40001`, and the manager re-runs that whole action: it re-reads 2000 and returns "insufficient funds".
+
+The rule of thumb: a method whose writes depend on what it read belongs in `RunInTx`; a method that only records facts it was given (create, append, update by key) is fine in `RunWith`, which never holds a transaction open during business logic. Because `RunInTx` re-runs the action, the action must be safe to repeat with respect to side effects outside the database.
+
+The generated `uow_service` middleware uses `RunWith`; mark a method `//middlegen:in-tx` to wrap it in `RunInTx` instead (see the [walkthrough](#step-2-define-the-service--annotate-for-middlegen) and the [directives](#directives)).
 
 ### Using the unit of work directly
 
@@ -469,7 +488,7 @@ type Repository interface {
 }
 ```
 
-**`uow_repo`** (`repository_uow_middleware.gen.go`): reads run immediately; writes are queued on the unit of work found in the context while its transaction is not open yet (a `RunWith` action), and the caller gets its own object back. Inside an open transaction (a `RunInTx` action, or a deferred task) and without a unit of work in the context, every method is a plain pass-through.
+**`uow_repo`** (`repository_uow_middleware.gen.go`): reads run immediately; writes are queued on the unit of work found in the context and the caller gets its own object back. Without a unit of work in the context (outside any boundary, or inside a deferred task) every method is a plain pass-through.
 
 ```go
 func (m *repositoryUoWMiddleware) GetByID(ctx context.Context, id string) (*Account, error) {
@@ -477,9 +496,7 @@ func (m *repositoryUoWMiddleware) GetByID(ctx context.Context, id string) (*Acco
 }
 
 func (m *repositoryUoWMiddleware) Save(ctx context.Context, acc *Account) (*Account, error) {
-	// Queued while the unit of work's transaction is not open yet (RunWith);
-	// executed immediately inside an open transaction (RunInTx, deferred tasks).
-	if uowInstance, ok := uow.Extract(ctx); ok && !uow.InTransaction(ctx) {
+	if uowInstance, ok := uow.Extract(ctx); ok {
 		uowInstance.Defer(func(txCtx context.Context) error {
 			_, err := m.next.Save(txCtx, acc)
 			return err
@@ -490,9 +507,7 @@ func (m *repositoryUoWMiddleware) Save(ctx context.Context, acc *Account) (*Acco
 }
 
 func (m *repositoryUoWMiddleware) Merge(ctx context.Context, src *Account, dst *Account) (*Account, error) {
-	// Queued while the unit of work's transaction is not open yet (RunWith);
-	// executed immediately inside an open transaction (RunInTx, deferred tasks).
-	if uowInstance, ok := uow.Extract(ctx); ok && !uow.InTransaction(ctx) {
+	if uowInstance, ok := uow.Extract(ctx); ok {
 		uowInstance.Defer(func(txCtx context.Context) error {
 			_, err := m.next.Merge(txCtx, src, dst)
 			return err
@@ -503,9 +518,7 @@ func (m *repositoryUoWMiddleware) Merge(ctx context.Context, src *Account, dst *
 }
 
 func (m *repositoryUoWMiddleware) RotateKey(ctx context.Context, id string, secret string) (string, error) {
-	// Queued while the unit of work's transaction is not open yet (RunWith);
-	// executed immediately inside an open transaction (RunInTx, deferred tasks).
-	if uowInstance, ok := uow.Extract(ctx); ok && !uow.InTransaction(ctx) {
+	if uowInstance, ok := uow.Extract(ctx); ok {
 		uowInstance.Defer(func(txCtx context.Context) error {
 			_, err := m.next.RotateKey(txCtx, id, secret)
 			return err
@@ -516,9 +529,7 @@ func (m *repositoryUoWMiddleware) RotateKey(ctx context.Context, id string, secr
 }
 
 func (m *repositoryUoWMiddleware) Delete(ctx context.Context, id string, reason string) error {
-	// Queued while the unit of work's transaction is not open yet (RunWith);
-	// executed immediately inside an open transaction (RunInTx, deferred tasks).
-	if uowInstance, ok := uow.Extract(ctx); ok && !uow.InTransaction(ctx) {
+	if uowInstance, ok := uow.Extract(ctx); ok {
 		uowInstance.Defer(func(txCtx context.Context) error {
 			return m.next.Delete(txCtx, id, reason)
 		})
@@ -601,7 +612,7 @@ Every kind produces one file, `<iface><suffix>`, where `<iface>` is the interfac
 | `logging` | `<Iface>LoggingMiddleware()` | `_logging_middleware.gen.go` | `slog.Default()` (captured when the constructor runs) with `service=<service>`. `<Method> started` at `Debug` with every parameter, `<Method> failed` at `Error` with `error`. Methods with a context use the `*Context` variants so records carry the trace and span IDs. |
 | `tracing` | `<Iface>TracingMiddleware()` | `_tracing_middleware.gen.go` | Span `<service>.<Method>` of kind internal from `otel.Tracer(<service>)`; on error `RecordError` and status `Error`. Methods without a context are forwarded unchanged. |
 | `metrics` | `<Iface>MetricsMiddleware()` | `_metrics_middleware.gen.go` | On meter `<service>`: `<iface>_requests_total`, `<iface>_errors_total` and `<iface>_request_duration_seconds` (seconds, `DefaultLatencyBuckets`) with attribute `method` plus the `metric attr` attributes; one `Int64Counter` per `metric counter` name, without attributes. Methods without a context are measured with a background context. |
-| `uow_repo` | `<Iface>UoWMiddleware()` | `_uow_middleware.gen.go` | Methods with a context and without `non-transactional` are queued on the unit of work in the context while its transaction is not open yet, and return immediately (see [What deferred methods return](#what-deferred-methods-return)). Inside an open transaction they execute right away; everything else passes through. |
+| `uow_repo` | `<Iface>UoWMiddleware()` | `_uow_middleware.gen.go` | Methods with a context and without `non-transactional` are queued on the unit of work in the context and return immediately (see [What deferred methods return](#what-deferred-methods-return)); everything else passes through. |
 | `uow_service` | `<Iface>UoWMiddleware(manager *uow.Manager)` | `_uow_middleware.gen.go` | Every method with a context runs inside `manager.RunWith`, or `manager.RunInTx` when marked `//middlegen:in-tx`, so the writes it makes through decorated repositories commit when it returns. A nested call joins the outer boundary (see [Nesting](#nesting)). |
 
 `uow_repo` and `uow_service` write the same file and constructor name, so generate one or the other for a given interface: repositories get `uow_repo`, the services calling them get `uow_service`.
@@ -634,7 +645,7 @@ A `uow_repo` method that runs inside a unit of work is queued, not executed, so 
 - Otherwise, a result is echoed when **exactly one** parameter has its type (a `*T` parameter also satisfies a `T` result, guarded against `nil`, and vice versa) and that type is not a basic type (`string`, `int`, `bool`, ...). `Save(ctx, user *User) (*User, error)` returns `user`.
 - Every other result is its zero value. Basic-typed results are never echoed from parameters; when several parameters are candidates, the generator warns and returns the zero value until you add an `echo` directive.
 
-Read methods must be annotated `//middlegen:non-transactional` so they execute immediately and return real data. Inside an open transaction (a `RunInTx` action or a deferred task) nothing is deferred, so every method returns the implementation's real results.
+Read methods must be annotated `//middlegen:non-transactional` so they execute immediately and return real data. Inside a deferred task the context carries no unit of work, so a decorated call made from a task executes immediately as well.
 
 ### Notes on generated code
 

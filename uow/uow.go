@@ -85,9 +85,9 @@ func Extract(ctx context.Context) (*UnitOfWork, bool) {
 
 // InTransaction reports whether ctx carries a database transaction opened by
 // a Manager. It is true for the context a RunInTx action receives and for
-// the context deferred tasks run with, and false inside a RunWith action,
-// where writes are still to be queued. Code that must not defer once the
-// transaction is open (such as the generated uow_repo middleware) checks it.
+// the context deferred tasks run with, and false inside a RunWith action.
+// The Manager uses it to decide how a nested boundary joins; callers can use
+// it to assert where their code runs.
 func InTransaction(ctx context.Context) bool {
 	return ctx.Value(txKey{}) == true
 }
@@ -261,13 +261,11 @@ func (m *Manager) RunWith(ctx context.Context, action ActionFn) error {
 // RunInTx runs a business action in the transactional model:
 //
 //  1. A transaction is opened first. action runs with a context that carries
-//     both the transaction (so repository reads and immediate writes execute
-//     inside it) and a new UnitOfWork. [InTransaction] is true for it, so the
-//     generated uow_repo middleware executes writes immediately instead of
-//     queueing them.
-//  2. Tasks deferred during action run in the same transaction after action
-//     returns nil, then the transaction is committed. An error from action
-//     rolls back.
+//     both the transaction, so repository reads execute inside it under its
+//     isolation level, and a new UnitOfWork. Writes made through the
+//     generated uow_repo middleware are queued exactly as in RunWith.
+//  2. The queued tasks run in the same transaction after action returns nil,
+//     then the transaction is committed. An error from action rolls back.
 //  3. If any step fails with an error the retry evaluator accepts, the whole
 //     action is re-run in a fresh transaction. action must therefore be safe
 //     to repeat with respect to side effects outside the database.

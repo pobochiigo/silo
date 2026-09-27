@@ -23,7 +23,7 @@ go run ./middlegen
 | `RotateKey` | `//middlegen:redact key` | Logged as `key=[REDACTED]`. |
 | `Decrement` | none | Basic-typed results are never echoed: returns `0` while queued. |
 | `io.Closer` | none | No context: logged and measured, not traced or deferred. |
-| `Service.Reserve` | `//middlegen:in-tx` | Wrapped in `RunInTx`: `BEGIN` first, writes execute at once. |
+| `Service.Reserve` | `//middlegen:in-tx` | Wrapped in `RunInTx`: `BEGIN` first, the read runs inside the transaction, the queued write runs before `COMMIT`. |
 
 `Service` is decorated from `inventory/svcmw`, a separate package, with
 `-dir=middlegen/inventory`: the generated code imports `inventory` and refers
@@ -44,14 +44,17 @@ level=DEBUG msg="Save started" service=inventory item="&{SKU:widget Name:widget 
    [span] inventory.Restock          91µs  ok
 ```
 
-Step 2, `RunInTx` through `//middlegen:in-tx`: `BEGIN` comes first and the
-write executes inside the method.
+Step 2, `RunInTx` through `//middlegen:in-tx`: `BEGIN` comes first, the read
+runs inside the transaction, and the queued write still runs after the
+method body, just before `COMMIT`. Same single write phase, different
+snapshot for the read.
 
 ```
 level=DEBUG msg="Reserve started" service=inventory sku=widget qty=3
    [tx] BEGIN
 level=DEBUG msg="Get started" service=inventory sku=widget
 level=DEBUG msg="Save started" service=inventory item="&{SKU:widget Name:widget Quantity:10 Reserved:3}"
+   [span] inventory.Save              4µs  ok
    [repo] Save executed: widget quantity=10 reserved=3
    [tx] COMMIT
 ```

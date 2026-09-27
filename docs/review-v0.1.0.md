@@ -23,7 +23,7 @@ between paths, where the context said one thing and the code assumed another.
 | H1 | High | `RunInTx` nested in a `RunWith` action ran its action with no transaction at all. | Fixed: returns `uow.ErrNoTransaction`. |
 | H2 | High | `RunWith`/`RunInTx` called with a context carrying an open transaction but no unit of work (a deferred task) opened a second transaction inside the first. | Fixed: joins the open transaction. |
 | M1 | Medium | A task that deferred more work, or a late `Defer` from a goroutine, lost that work silently. | Fixed: `uow.ErrLateDefer`. |
-| M2 | Medium | Inside `RunInTx` the generated `uow_repo` middleware still queued writes: callers got echoed inputs instead of results and later reads did not see the writes. | Fixed: writes execute immediately inside an open transaction. |
+| M2 | Design decision | Inside `RunInTx` the generated `uow_repo` middleware queues writes, as in `RunWith`, so callers get echoed inputs and reads in the same action do not see the writes. | Kept as is, by the maintainer's decision: the unit of work stays the single writer. |
 | M3 | Medium | `uow_service` could only wrap methods in `RunWith`; read-modify-write service methods had no way to get `RunInTx`. | Fixed: `//middlegen:in-tx`. |
 | M4 | Medium | An executor helper called with a transaction of the other driver family in the context fell back to the pool, running the statement outside the transaction. | Fixed: panics with a message naming both sides. |
 | L1 | Low | `db.PGXCommon` had no `SendBatch`/`CopyFrom`, so batches and COPY could not run through the unit of work. | Fixed. |
@@ -54,7 +54,7 @@ H2 and M2:
 | Context carries | Where that happens | Before | Now |
 |---|---|---|---|
 | unit, no transaction | a `RunWith` action | `RunInTx` joined and ran with no transaction (H1) | `RunInTx` returns `ErrNoTransaction`; `RunWith` joins |
-| unit and transaction | a `RunInTx` action | join; generated writes were still queued (M2) | join; generated writes execute immediately |
+| unit and transaction | a `RunInTx` action | join | join; generated writes stay queued (M2) |
 | transaction, no unit | a deferred task | `RunWith`/`RunInTx` began a second transaction (H2) | run the action in the open transaction with a fresh unit; the outer boundary commits |
 | neither | top level | open a boundary | unchanged |
 
@@ -107,21 +107,26 @@ the snapshot re-runs and re-defers, so the queue would grow with duplicates.
 Tests: `TestRunWith_TaskDeferringTaskIsReported`,
 `TestRunInTx_TaskDeferringTaskIsReported`, `TestRunWith_LateDeferIsNotRetried`.
 
-### M2. Generated repositories queued writes inside `RunInTx`
+### M2. Writes stay queued inside `RunInTx` (design decision)
 
-The `uow_repo` template deferred every write when the context carried a unit
-of work, including inside `RunInTx`, where the transaction is already open.
-The caller received the echoed input instead of the implementation's result
-(no `RETURNING` values), and a read after a write in the same action did not
-see the write. Deferral exists to avoid holding a transaction open during
-the action; once it is open, deferral only loses information.
+The `uow_repo` template defers every write when the context carries a unit
+of work, inside `RunInTx` too, although the transaction is already open
+there. The caller therefore receives the echoed input rather than the
+implementation's result (no `RETURNING` values during the action), and a
+read after a write in the same action does not see the write.
 
-**Fix.** The template checks `uow.InTransaction(ctx)` and calls the
-implementation directly when it is true. Deferred tasks run with the same
-mark, so a repository call from a task also executes immediately instead of
-re-queueing. `RunInTx` still runs tasks deferred by hand after the action.
-Tests: `TestInsideOpenTransactionWritesRunImmediately` in the scaffolded
-module, and the golden files.
+Executing those writes immediately inside an open transaction was
+implemented and then reverted. It would have kept atomicity (the writes run
+in the same transaction either way) and gained read-your-writes and real
+results, but at the price of the model the library is built on: the unit of
+work is the single, controlled place where writes happen, and a decorated
+write should mean the same thing in every boundary. Isolation, the reason
+`RunInTx` exists, does not need immediate writes: reads inside the
+transaction plus writes queued to the end of the same transaction are fully
+covered by the transactor's isolation level, as the ledger example shows
+under SERIALIZABLE. The template is therefore unchanged from v0.1.0, and
+`TestWritesAreQueuedInsideRunInTxToo` in the scaffolded module pins the
+behaviour. `uow.InTransaction` remains as the manager's nesting primitive.
 
 ### M3. No `RunInTx` for generated services
 
@@ -205,9 +210,8 @@ These changes call for a minor version bump (v0.2.0):
 - `RunWith`/`RunInTx` inside a deferred task join the open transaction
   instead of opening a second one.
 - Late `Defer` calls return `ErrLateDefer` instead of being dropped.
-- Regenerated `uow_repo` middlewares execute writes immediately inside an
-  open transaction; the templates changed, so regenerate with the new
-  generator.
+- The `uow_repo` template is unchanged; regeneration is only needed to use
+  `//middlegen:in-tx`, which changes the `uow_service` template.
 - `db.Executor`, `db.XExecutor` and `db.PGXExecutor` panic on a transaction of
   the other driver family.
 - `db.PGXCommon` and `db.SQLXCommon` gained methods; custom implementations
