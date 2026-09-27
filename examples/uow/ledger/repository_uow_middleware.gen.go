@@ -27,9 +27,7 @@ func (m *repositoryUoWMiddleware) ListEntries(ctx context.Context, accountID str
 }
 
 func (m *repositoryUoWMiddleware) CreateAccount(ctx context.Context, acc *Account) (*Account, error) {
-	// Queued while the unit of work's transaction is not open yet (RunWith);
-	// executed immediately inside an open transaction (RunInTx, deferred tasks).
-	if uowInstance, ok := uow.Extract(ctx); ok && !uow.InTransaction(ctx) {
+	if uowInstance, ok := uow.Extract(ctx); ok {
 		uowInstance.Defer(func(txCtx context.Context) error {
 			_, err := m.next.CreateAccount(txCtx, acc)
 			return err
@@ -40,9 +38,7 @@ func (m *repositoryUoWMiddleware) CreateAccount(ctx context.Context, acc *Accoun
 }
 
 func (m *repositoryUoWMiddleware) AddEntry(ctx context.Context, entry *Entry) (*Entry, error) {
-	// Queued while the unit of work's transaction is not open yet (RunWith);
-	// executed immediately inside an open transaction (RunInTx, deferred tasks).
-	if uowInstance, ok := uow.Extract(ctx); ok && !uow.InTransaction(ctx) {
+	if uowInstance, ok := uow.Extract(ctx); ok {
 		uowInstance.Defer(func(txCtx context.Context) error {
 			_, err := m.next.AddEntry(txCtx, entry)
 			return err
@@ -53,9 +49,7 @@ func (m *repositoryUoWMiddleware) AddEntry(ctx context.Context, entry *Entry) (*
 }
 
 func (m *repositoryUoWMiddleware) AdjustBalance(ctx context.Context, id string, delta int64) error {
-	// Queued while the unit of work's transaction is not open yet (RunWith);
-	// executed immediately inside an open transaction (RunInTx, deferred tasks).
-	if uowInstance, ok := uow.Extract(ctx); ok && !uow.InTransaction(ctx) {
+	if uowInstance, ok := uow.Extract(ctx); ok {
 		uowInstance.Defer(func(txCtx context.Context) error {
 			return m.next.AdjustBalance(txCtx, id, delta)
 		})

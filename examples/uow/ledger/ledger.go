@@ -54,8 +54,8 @@ type Repository interface {
 	//middlegen:non-transactional
 	ListEntries(ctx context.Context, accountID string, limit int) ([]Entry, error)
 
-	// Writes are queued while a RunWith action runs (the caller gets acc back)
-	// and executed immediately inside a RunInTx action.
+	// Writes are queued on the unit of work (the caller gets acc back) and run
+	// when the boundary's transaction commits, in RunWith and RunInTx alike.
 	//middlegen:metric counter:ledger_accounts_created_total
 	CreateAccount(ctx context.Context, acc *Account) (*Account, error)
 

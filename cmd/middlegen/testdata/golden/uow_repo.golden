@@ -36,9 +36,7 @@ func (m *exampleUoWMiddleware) Ping() error {
 }
 
 func (m *exampleUoWMiddleware) Name(ctx context.Context) string {
-	// Queued while the unit of work's transaction is not open yet (RunWith);
-	// executed immediately inside an open transaction (RunInTx, deferred tasks).
-	if uowInstance, ok := uow.Extract(ctx); ok && !uow.InTransaction(ctx) {
+	if uowInstance, ok := uow.Extract(ctx); ok {
 		uowInstance.Defer(func(txCtx context.Context) error {
 			m.next.Name(txCtx)
 			return nil
@@ -49,9 +47,7 @@ func (m *exampleUoWMiddleware) Name(ctx context.Context) string {
 }
 
 func (m *exampleUoWMiddleware) Fire(ctx context.Context) {
-	// Queued while the unit of work's transaction is not open yet (RunWith);
-	// executed immediately inside an open transaction (RunInTx, deferred tasks).
-	if uowInstance, ok := uow.Extract(ctx); ok && !uow.InTransaction(ctx) {
+	if uowInstance, ok := uow.Extract(ctx); ok {
 		uowInstance.Defer(func(txCtx context.Context) error {
 			m.next.Fire(txCtx)
 			return nil
@@ -62,9 +58,7 @@ func (m *exampleUoWMiddleware) Fire(ctx context.Context) {
 }
 
 func (m *exampleUoWMiddleware) Save(ctx context.Context, item *Item) (*Item, error) {
-	// Queued while the unit of work's transaction is not open yet (RunWith);
-	// executed immediately inside an open transaction (RunInTx, deferred tasks).
-	if uowInstance, ok := uow.Extract(ctx); ok && !uow.InTransaction(ctx) {
+	if uowInstance, ok := uow.Extract(ctx); ok {
 		uowInstance.Defer(func(txCtx context.Context) error {
 			_, err := m.next.Save(txCtx, item)
 			return err
@@ -75,9 +69,7 @@ func (m *exampleUoWMiddleware) Save(ctx context.Context, item *Item) (*Item, err
 }
 
 func (m *exampleUoWMiddleware) Copy(ctx context.Context, src *Item, dst *Item) (*Item, error) {
-	// Queued while the unit of work's transaction is not open yet (RunWith);
-	// executed immediately inside an open transaction (RunInTx, deferred tasks).
-	if uowInstance, ok := uow.Extract(ctx); ok && !uow.InTransaction(ctx) {
+	if uowInstance, ok := uow.Extract(ctx); ok {
 		uowInstance.Defer(func(txCtx context.Context) error {
 			_, err := m.next.Copy(txCtx, src, dst)
 			return err
@@ -88,9 +80,7 @@ func (m *exampleUoWMiddleware) Copy(ctx context.Context, src *Item, dst *Item) (
 }
 
 func (m *exampleUoWMiddleware) Rotate(ctx context.Context, name string, secret string) (string, bool, error) {
-	// Queued while the unit of work's transaction is not open yet (RunWith);
-	// executed immediately inside an open transaction (RunInTx, deferred tasks).
-	if uowInstance, ok := uow.Extract(ctx); ok && !uow.InTransaction(ctx) {
+	if uowInstance, ok := uow.Extract(ctx); ok {
 		uowInstance.Defer(func(txCtx context.Context) error {
 			_, _, err := m.next.Rotate(txCtx, name, secret)
 			return err
@@ -101,9 +91,7 @@ func (m *exampleUoWMiddleware) Rotate(ctx context.Context, name string, secret s
 }
 
 func (m *exampleUoWMiddleware) Materialize(ctx context.Context, tArg *Item, okArg bool) (Item, error) {
-	// Queued while the unit of work's transaction is not open yet (RunWith);
-	// executed immediately inside an open transaction (RunInTx, deferred tasks).
-	if uowInstance, ok := uow.Extract(ctx); ok && !uow.InTransaction(ctx) {
+	if uowInstance, ok := uow.Extract(ctx); ok {
 		uowInstance.Defer(func(txCtx context.Context) error {
 			_, err := m.next.Materialize(txCtx, tArg, okArg)
 			return err
@@ -118,9 +106,7 @@ func (m *exampleUoWMiddleware) Materialize(ctx context.Context, tArg *Item, okAr
 }
 
 func (m *exampleUoWMiddleware) Schedule(ctx context.Context, at time.Time, items ...*Item) error {
-	// Queued while the unit of work's transaction is not open yet (RunWith);
-	// executed immediately inside an open transaction (RunInTx, deferred tasks).
-	if uowInstance, ok := uow.Extract(ctx); ok && !uow.InTransaction(ctx) {
+	if uowInstance, ok := uow.Extract(ctx); ok {
 		uowInstance.Defer(func(txCtx context.Context) error {
 			return m.next.Schedule(txCtx, at, items...)
 		})
@@ -130,9 +116,7 @@ func (m *exampleUoWMiddleware) Schedule(ctx context.Context, at time.Time, items
 }
 
 func (m *exampleUoWMiddleware) Tag(p0 string, ctx context.Context) error {
-	// Queued while the unit of work's transaction is not open yet (RunWith);
-	// executed immediately inside an open transaction (RunInTx, deferred tasks).
-	if uowInstance, ok := uow.Extract(ctx); ok && !uow.InTransaction(ctx) {
+	if uowInstance, ok := uow.Extract(ctx); ok {
 		uowInstance.Defer(func(txCtx context.Context) error {
 			return m.next.Tag(p0, txCtx)
 		})
@@ -142,9 +126,7 @@ func (m *exampleUoWMiddleware) Tag(p0 string, ctx context.Context) error {
 }
 
 func (m *exampleUoWMiddleware) Transfer(ctx context.Context, from string, to string, amount int64) error {
-	// Queued while the unit of work's transaction is not open yet (RunWith);
-	// executed immediately inside an open transaction (RunInTx, deferred tasks).
-	if uowInstance, ok := uow.Extract(ctx); ok && !uow.InTransaction(ctx) {
+	if uowInstance, ok := uow.Extract(ctx); ok {
 		uowInstance.Defer(func(txCtx context.Context) error {
 			return m.next.Transfer(txCtx, from, to, amount)
 		})

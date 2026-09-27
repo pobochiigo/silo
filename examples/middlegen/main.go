@@ -67,7 +67,7 @@ func main() {
 	}
 	fmt.Printf("   Restock returned the item it saved: %+v\n", *item)
 
-	demo.Step(2, "RunInTx (//middlegen:in-tx): BEGIN comes first and Save executes immediately, inside the transaction")
+	demo.Step(2, "RunInTx (//middlegen:in-tx): BEGIN comes first, Get runs inside the transaction, the queued Save runs before COMMIT")
 	if err := svc.Reserve(ctx, "widget", 3); err != nil {
 		demo.Fail("reserve", err)
 	}

@@ -33,7 +33,8 @@ type Reader interface {
 }
 
 // Repository is decorated with all four kinds. Reads run immediately; writes
-// are queued inside RunWith and executed at once inside RunInTx.
+// are queued on the unit of work and run when its transaction commits, in
+// RunWith and RunInTx alike.
 //
 //go:generate go tool middlegen -type=Repository -kinds=uow_repo,logging,tracing,metrics -service=inventory
 type Repository interface {
@@ -77,8 +78,9 @@ type Service interface {
 	// after the method returns.
 	Restock(ctx context.Context, sku string, qty int) (*Item, error)
 
-	// Reserve checks and updates stock under one transaction: the check would
-	// be meaningless if the write happened later.
+	// Reserve checks and updates stock under one transaction: the read and
+	// the queued write share its isolation level, so a concurrent reservation
+	// cannot slip in between them.
 	//middlegen:in-tx
 	Reserve(ctx context.Context, sku string, qty int) error
 
