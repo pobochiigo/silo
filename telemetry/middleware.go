@@ -128,15 +128,13 @@ func TracingMiddleware(operationName string) endpoint.Middleware {
 
 			// Run the next middleware / endpoint business logic
 			response, err := next(ctx, request)
-			// Record errors if the endpoint failed
+			// Record errors if the endpoint failed. Success leaves the status
+			// unset, as the OpenTelemetry specification asks of instrumentation
+			// and as the generated tracing middleware does.
 			if err != nil {
 				span.RecordError(err)
 				span.SetStatus(codes.Error, err.Error())
-
-				return response, err
 			}
-
-			span.SetStatus(codes.Ok, "success")
 
 			return response, err
 		}
