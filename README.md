@@ -23,6 +23,12 @@ go install github.com/pobochiigo/silo/cmd/middlegen@latest
 
 ---
 
+## Releasing
+
+Releases are cut from the GitHub Actions tab: run the **Release** workflow with the version to publish (for example `v0.1.0`). It verifies the module on the selected ref, creates the annotated tag, publishes a GitHub Release with generated notes, and asks the Go module proxy to index the new version.
+
+---
+
 ## Directory Structure
 
 ```
