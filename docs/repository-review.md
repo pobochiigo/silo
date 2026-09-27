@@ -26,7 +26,7 @@ that has not happened yet. What changed per finding:
 | M5 | `//middlegen:redact <param>` logs `[REDACTED]`; the "started" line moved to `Debug`. |
 | M6 | The dynamic `sqlx.Tx` wrapper always carries a mapper; an executor that cannot be adapted panics instead of escaping the transaction. |
 | L1 | Metric attribute expressions are rewritten to the renamed parameters; README carries a cardinality warning. |
-| L2 | Resource adds the SDK and environment detectors and the schema URL (semconv v1.41.0); the environment is emitted under both `deployment.environment.name` and `deployment.environment`. |
+| L2 | Resource adds the SDK, host and environment detectors; the schema URL is left to the detectors (pinning one made `resource.New` fail with a schema conflict after an SDK upgrade); the environment is emitted under both `deployment.environment.name` and `deployment.environment`. |
 | L3 | Backoff subtracts up to 25% jitter and cannot overflow. |
 | L4 | Stale skip entries removed. |
 | L5 | Duplicate branch removed. |

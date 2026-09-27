@@ -12,13 +12,20 @@ Silo is a core library containing a transactional Unit of Work engine, OpenTelem
 
 ## Installation
 
+Silo requires Go 1.27.1 or newer.
+
 ```bash
 go get github.com/pobochiigo/silo
 ```
 
-To install the middleware generator CLI:
+The middleware generator is a separate binary. Install it at the library version your module uses, since the generated code calls into the library:
 ```bash
-go install github.com/pobochiigo/silo/cmd/middlegen@latest
+go install github.com/pobochiigo/silo/cmd/middlegen@$(go list -m -f '{{.Version}}' github.com/pobochiigo/silo)
+```
+
+Or skip the install and let `go generate` fetch it, pinned, on demand:
+```go
+//go:generate go run github.com/pobochiigo/silo/cmd/middlegen@v0.1.0 -type=UserRepository -kinds=uow_repo,logging,tracing
 ```
 
 ---
@@ -37,6 +44,7 @@ silo/
 │   └── middlegen/       # Middleware decorator generator CLI
 ├── connectrpc/          # ConnectRPC adapters for type-safe endpoints
 ├── db/                  # SQL, sqlx and pgx database transaction adapters
+├── docs/                # Design notes and review history
 ├── endpoint/            # Generic, type-safe endpoint signature
 ├── middleware/          # Generic middleware type definitions
 ├── telemetry/           # OpenTelemetry trackers, exporters, and middlewares
@@ -77,6 +85,22 @@ The transaction, its isolation level and the retries therefore cover the deferre
 3. On a retryable error the **whole action** is re-run in a fresh transaction. The action must therefore be safe to repeat with respect to side effects outside the database.
 
 Use `RunInTx` for read-modify-write logic that must be isolated; use `RunWith` when the action is pure computation plus writes and you want to avoid holding a transaction open.
+
+### Using the unit of work directly
+
+The generated `uow_repo` middleware is a convenience: any code can queue work on the unit of work carried by the context. The executor helpers in `db` pick the transaction out of the context the task receives.
+
+```go
+err := manager.RunWith(ctx, func(ctx context.Context) error {
+	unit, _ := uow.Extract(ctx) // always present inside RunWith and RunInTx
+	unit.Defer(func(txCtx context.Context) error {
+		_, err := db.PGXExecutor(txCtx, pool).Exec(txCtx,
+			"INSERT INTO users (id, name) VALUES ($1, $2)", id, name)
+		return err
+	})
+	return nil // the transaction opens here and runs the queued task
+})
+```
 
 ### Nesting and multiple databases
 
@@ -206,6 +230,8 @@ Run Go generate from your shell:
 ```bash
 go generate ./...
 ```
+The `//go:generate middlegen` lines expect the binary on your `PATH` (`go install` puts it in `$(go env GOPATH)/bin`); the `go run ...@v0.1.0` form from [Installation](#installation) needs nothing installed. Regenerating is always safe: previously generated `.gen.go` files are ignored while the package is loaded, so stale output that no longer compiles does not block the generator.
+
 This automatically produces the following decorators inside your package directories:
 - `user_repository_logging_middleware.gen.go`
 - `user_repository_tracing_middleware.gen.go`
@@ -268,7 +294,9 @@ func main() {
 	// 4. Instantiate and Decorate the Repository
 	rawRepo := mydb.NewUserRepository(pool)
 
-	// Apply Repository decorators (ordering: innermost is raw implementation)
+	// Apply Repository decorators (ordering: innermost is raw implementation).
+	// Build them after InitTelemetry: the logging middleware captures
+	// slog.Default() when its constructor runs.
 	repo := mydb.UserRepositoryUoWMiddleware()(rawRepo)
 	repo = mydb.UserRepositoryLoggingMiddleware()(repo)
 	repo = mydb.UserRepositoryTracingMiddleware()(repo)
@@ -325,16 +353,22 @@ pgxTx  := db.NewPGXTransactor(pgxPool, db.WithPGXTxOptions(pgx.TxOptions{IsoLeve
 |---|---|---|
 | `-type` | *(Required)* | Target interface name to generate middlewares for (e.g. `UserRepository`). |
 | `-kinds` | `logging,tracing,metrics` | Comma-separated middlewares to generate (`logging`, `tracing`, `metrics`, `uow_repo`, `uow_service`). |
-| `-service` | *(Inferred)* | The telemetry service prefix/name. Defaults to package name. |
-| `-dir` | `""` | Directory relative to module root where the interface is declared. |
-| `-prefix` | `middlegen` | Directive prefix namespace for comment annotations. |
+| `-service` | *(Inferred)* | Telemetry name: the `service` log attribute, the tracer and meter name, and the span-name prefix. Defaults to the lowercased package name. |
+| `-dir` | `""` | Directory, relative to the module root, of the package declaring the interface. The generated files are written to the working directory and belong to its package (see [Generating into another package](#generating-into-another-package)). |
+| `-prefix` | `middlegen` | Directive prefix namespace for comment annotations (`//<prefix>:...`). |
 | `-middleware-import` | *(Inferred)* | Import path of the generic `Middleware` helper package. |
 | `-middleware-type` | `middleware.Middleware` | The type signature representation for middlewares. |
 | `-library-module` | `github.com/pobochiigo/silo` | Module path providing the `middleware`/`telemetry`/`uow` packages referenced by generated code. |
 
 ### Directives
 
-Directives are comments placed on interface methods (doc comment or trailing line comment), prefixed with `-prefix`:
+Directives are comments on the methods of the interface, written `//<prefix>:<directive> [arguments]` with no space after `//` (the default prefix is `middlegen`, see `-prefix`). The rules:
+
+- A directive goes in the method's doc comment (the lines above it) or in its trailing line comment. Several directives can be stacked on one method, mixed with ordinary comment lines.
+- Directives written on the methods of an embedded interface apply wherever that interface is embedded, whichever package declares it.
+- Parameter lists are separated by commas or spaces and use the names from the interface declaration, even when the generator renames a parameter internally.
+- A directive that names an unknown parameter, or an `echo` that lists more parameters than the method has non-error results, aborts generation with an error naming the method.
+- Directives for kinds that are not being generated are ignored, so one interface can carry the directives of all five kinds.
 
 | Directive | Applies to | Effect |
 |---|---|---|
@@ -345,6 +379,201 @@ Directives are comments placed on interface methods (doc comment or trailing lin
 | `//middlegen:metric counter:<name>` | `metrics` | Increment a custom counter on every call. |
 
 > **Cardinality warning:** metric attributes become label values on every series. Never derive them from unbounded inputs such as user or order IDs.
+
+### Directives by example
+
+The interface below uses every directive. The excerpts that follow are what `middlegen -type=Repository -kinds=uow_repo,logging,tracing,metrics -service=accounts` generates for it, shortened to the relevant methods and annotated with `// <-` comments.
+
+`account/repository.go`:
+```go
+package account
+
+import "context"
+
+type Account struct {
+	ID      string
+	Balance int64
+}
+
+// Reader is embedded by Repository; the directives on its methods carry over.
+type Reader interface {
+	//middlegen:non-transactional
+	GetByID(ctx context.Context, id string) (*Account, error)
+
+	List(ctx context.Context, limit int) ([]Account, error) //middlegen:non-transactional
+}
+
+//go:generate middlegen -type=Repository -kinds=uow_repo,logging,tracing,metrics -service=accounts
+type Repository interface {
+	Reader
+
+	// Exactly one parameter has the result's type, so a deferred Save hands
+	// acc straight back to the caller.
+	//middlegen:metric counter:account_saves_total
+	Save(ctx context.Context, acc *Account) (*Account, error)
+
+	// Two parameters match the result: say which one to return.
+	//middlegen:echo dst
+	Merge(ctx context.Context, src, dst *Account) (*Account, error)
+
+	// Basic-typed results are never echoed; the secret never reaches the logs.
+	//middlegen:redact secret
+	RotateKey(ctx context.Context, id string, secret string) (string, error)
+
+	// reason is a small, fixed set of values: safe as a metric attribute.
+	//middlegen:metric attr:reason=reason
+	Delete(ctx context.Context, id string, reason string) error
+}
+```
+
+**`uow_repo`** (`repository_uow_middleware.gen.go`): reads run immediately, writes are queued on the unit of work found in the context, and the caller gets its own object back. Without a unit of work in the context every method is a plain pass-through.
+
+```go
+func (m *repositoryUoWMiddleware) GetByID(ctx context.Context, id string) (*Account, error) {
+	return m.next.GetByID(ctx, id) // <- non-transactional: never deferred
+}
+
+func (m *repositoryUoWMiddleware) Save(ctx context.Context, acc *Account) (*Account, error) {
+	if uowInstance, ok := uow.Extract(ctx); ok {
+		uowInstance.Defer(func(txCtx context.Context) error {
+			_, err := m.next.Save(txCtx, acc)
+			return err
+		})
+		return acc, nil // <- echoed: the only *Account parameter
+	}
+	return m.next.Save(ctx, acc)
+}
+
+func (m *repositoryUoWMiddleware) Merge(ctx context.Context, src *Account, dst *Account) (*Account, error) {
+	if uowInstance, ok := uow.Extract(ctx); ok {
+		uowInstance.Defer(func(txCtx context.Context) error {
+			_, err := m.next.Merge(txCtx, src, dst)
+			return err
+		})
+		return dst, nil // <- //middlegen:echo dst
+	}
+	return m.next.Merge(ctx, src, dst)
+}
+
+func (m *repositoryUoWMiddleware) RotateKey(ctx context.Context, id string, secret string) (string, error) {
+	if uowInstance, ok := uow.Extract(ctx); ok {
+		uowInstance.Defer(func(txCtx context.Context) error {
+			_, err := m.next.RotateKey(txCtx, id, secret)
+			return err
+		})
+		return "", nil // <- basic result: zero value while deferred
+	}
+	return m.next.RotateKey(ctx, id, secret)
+}
+
+func (m *repositoryUoWMiddleware) Delete(ctx context.Context, id string, reason string) error {
+	if uowInstance, ok := uow.Extract(ctx); ok {
+		uowInstance.Defer(func(txCtx context.Context) error {
+			return m.next.Delete(txCtx, id, reason)
+		})
+		return nil // <- error-only result: the write is queued, nothing to echo
+	}
+	return m.next.Delete(ctx, id, reason)
+}
+```
+
+**`logging`** (`repository_logging_middleware.gen.go`): one `Debug` line per call with every parameter, one `Error` line per failure. Redacted parameters keep their key.
+
+```go
+func RepositoryLoggingMiddleware() middleware.Middleware[Repository] {
+	logger := slog.Default().With(slog.String("service", "accounts")) // <- captured now, not per call
+	return func(next Repository) Repository {
+		return &repositoryLoggingService{Repository: next, next: next, logger: logger}
+	}
+}
+
+func (l *repositoryLoggingService) RotateKey(ctx context.Context, id string, secret string) (string, error) {
+	l.logger.DebugContext(ctx, "RotateKey started", slog.Any("id", id), slog.String("secret", "[REDACTED]"))
+	r0, err := l.next.RotateKey(ctx, id, secret)
+	if err != nil {
+		l.logger.ErrorContext(ctx, "RotateKey failed", slog.Any("error", err))
+	}
+	return r0, err
+}
+```
+
+**`metrics`** (`repository_metrics_middleware.gen.go`): the standard request, error and latency instruments are named after the interface; custom counters and attributes come from the directives.
+
+```go
+func RepositoryMetricsMiddleware() middleware.Middleware[Repository] {
+	meter := otel.GetMeterProvider().Meter("accounts")
+	recorder := telemetry.NewMetricsRecorder(meter, "repository") // <- repository_requests_total, repository_errors_total, repository_request_duration_seconds
+	accountSavesTotalCounter, err := recorder.Meter().Int64Counter("account_saves_total", metric.WithDescription("Custom counter for account_saves_total"))
+	if err != nil {
+		otel.Handle(err)
+	}
+	// ...
+}
+
+func (m *repositoryMetricsService) Save(ctx context.Context, acc *Account) (*Account, error) {
+	now := time.Now()
+	m.accountSavesTotalCounter.Add(ctx, 1) // <- //middlegen:metric counter:account_saves_total
+	r0, err := m.next.Save(ctx, acc)
+	m.recorder.Observe(ctx, "Save", now, err) // <- method="Save" on every instrument
+	return r0, err
+}
+
+func (m *repositoryMetricsService) Delete(ctx context.Context, id string, reason string) error {
+	now := time.Now()
+	err := m.next.Delete(ctx, id, reason)
+	m.recorder.Observe(ctx, "Delete", now, err, attribute.String("reason", fmt.Sprintf("%v", reason))) // <- //middlegen:metric attr:reason=reason
+	return err
+}
+```
+
+**`tracing`** (`repository_tracing_middleware.gen.go`): one internal span per call, named `<service>.<Method>`, with the error recorded and the span status set on failure.
+
+```go
+func (t *repositoryTracingService) Save(ctx context.Context, acc *Account) (*Account, error) {
+	ctx, span := t.tracer.Start(ctx, "accounts.Save", trace.WithSpanKind(trace.SpanKindInternal))
+	defer span.End()
+	r0, err := t.next.Save(ctx, acc)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	return r0, err
+}
+```
+
+### What each kind generates
+
+Every kind produces one file, `<iface><suffix>`, where `<iface>` is the interface name in snake case (`UserRepository` becomes `user_repository`). Each file holds a constructor that returns a `middleware.Middleware[T]` (a `func(T) T`), so decorators chain by application: the innermost call wraps the raw implementation.
+
+| Kind | Constructor | File suffix | Behaviour |
+|---|---|---|---|
+| `logging` | `<Iface>LoggingMiddleware()` | `_logging_middleware.gen.go` | `slog.Default()` (captured when the constructor runs) with `service=<service>`. `<Method> started` at `Debug` with every parameter, `<Method> failed` at `Error` with `error`. Methods with a context use the `*Context` variants so records carry the trace and span IDs. |
+| `tracing` | `<Iface>TracingMiddleware()` | `_tracing_middleware.gen.go` | Span `<service>.<Method>` of kind internal from `otel.Tracer(<service>)`; on error `RecordError` and status `Error`. Methods without a context are forwarded unchanged. |
+| `metrics` | `<Iface>MetricsMiddleware()` | `_metrics_middleware.gen.go` | On meter `<service>`: `<iface>_requests_total`, `<iface>_errors_total` and `<iface>_request_duration_seconds` (seconds, `DefaultLatencyBuckets`) with attribute `method` plus the `metric attr` attributes; one `Int64Counter` per `metric counter` name, without attributes. Methods without a context are measured with a background context. |
+| `uow_repo` | `<Iface>UoWMiddleware()` | `_uow_middleware.gen.go` | Methods with a context and without `non-transactional` are queued on the unit of work in the context and return immediately (see [What deferred methods return](#what-deferred-methods-return)); everything else passes through. |
+| `uow_service` | `<Iface>UoWMiddleware(manager *uow.Manager)` | `_uow_middleware.gen.go` | Every method with a context runs inside `manager.RunWith`, so the writes it queues through decorated repositories commit when it returns. A nested call joins the outer unit of work. |
+
+`uow_repo` and `uow_service` write the same file and constructor name, so generate one or the other for a given interface: repositories get `uow_repo`, the services calling them get `uow_service`.
+
+### Generating into another package
+
+With `-dir`, the interface can live in a different package than the generated decorators. Run the generator from the destination package; `-dir` is the interface's directory relative to the module root:
+
+`decorators/doc.go`:
+```go
+// Package decorators holds the middlewares generated for interfaces declared elsewhere.
+package decorators
+
+//go:generate middlegen -type=UserRepository -dir=db -kinds=logging,metrics -service=users
+```
+
+The generated file belongs to `package decorators`, imports the interface's package, and refers to it qualified:
+
+```go
+func UserRepositoryLoggingMiddleware() middleware.Middleware[db.UserRepository] {
+```
+
+The destination package must not be imported by the interface's package, or the generated import creates a cycle.
 
 ### What deferred methods return
 
@@ -363,6 +592,7 @@ Read methods must be annotated `//middlegen:non-transactional` so they execute i
 - Parameters whose names collide with identifiers used by the templates (`t`, `m`, `err`, `ok`, `span`, the packages the templates import such as `time` or `uow`, and the qualifiers of packages your signatures use) are transparently renamed in the generated code; log attribute keys and `metric attr` expressions keep the original names. Blank (`_`) and unnamed parameters become `p0`, `p1`, .... The context parameter may appear at any position.
 - Types from other packages are qualified from type information, so a package imported under an alias in your file, two packages sharing a name, or a package whose name differs from its path's last element (`pgx/v5`) are all imported correctly in the generated files.
 - The logging middleware logs the `<Method> started` line with all parameters at `Debug` level and failures at `Error` level. Redact secrets with `//middlegen:redact`.
+- The logging middleware captures `slog.Default()` when its constructor is called, so call `<Iface>LoggingMiddleware()` after `telemetry.InitTelemetry` (or your own `slog.SetDefault`), otherwise its records bypass the OTLP pipeline. Tracers and meters are taken from the global OpenTelemetry providers, which delegate to whatever provider is registered later, so their construction order does not matter.
 - A `uow_service` method that returns no `error` cannot report a failed commit; the generated wrapper logs the failure through `slog.Default()` and the generator prints a warning naming the method. Prefer returning an error.
 - Methods without a `context.Context` are still logged (without trace correlation) and measured; tracing needs a context to start a span, and Unit of Work boundaries need one to find the unit, so those wrappers forward such methods unchanged.
 - Generic interfaces (type parameters) are not supported; the generator refuses them with a clear message.
@@ -451,7 +681,7 @@ In addition to bootstrapping OpenTelemetry traces, metrics, and logs, the `telem
 | `LocalLogLevel` | Minimum level of the default local handler. Defaults to Info; set `slog.LevelDebug` to see the generated middlewares' "started" lines locally. |
 | `DisableLocalLogs` | Send logs to the collector only. Note that `slog.SetDefault` also routes the standard `log` package through slog, so nothing is written locally. |
 
-The resource also carries the `telemetry.sdk.*` attributes, `host.name`, and the semantic-conventions schema URL. Invalid configuration (a sample ratio outside `[0, 1]`, an unknown compressor, a malformed endpoint) is rejected by `InitTelemetry` before any exporter is created.
+The resource also carries the `telemetry.sdk.*` attributes and `host.name`. Its schema URL is the one the SDK's own resource detectors report, so it always matches the semantic conventions of the installed SDK; Silo does not pin one. Invalid configuration (a sample ratio outside `[0, 1]`, an unknown compressor, a malformed endpoint) is rejected by `InitTelemetry` before any exporter is created.
 
 ### Metrics
 
