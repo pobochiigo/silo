@@ -118,3 +118,12 @@ func (l *exampleLoggingService) Tag(p0 string, ctx context.Context) error {
 	}
 	return err
 }
+
+func (l *exampleLoggingService) Transfer(ctx context.Context, from string, to string, amount int64) error {
+	l.logger.DebugContext(ctx, "Transfer started", slog.Any("from", from), slog.Any("to", to), slog.Any("amount", amount))
+	err := l.next.Transfer(ctx, from, to, amount)
+	if err != nil {
+		l.logger.ErrorContext(ctx, "Transfer failed", slog.Any("error", err))
+	}
+	return err
+}

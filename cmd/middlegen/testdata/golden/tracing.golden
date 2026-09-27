@@ -127,3 +127,14 @@ func (t *exampleTracingService) Tag(p0 string, ctx context.Context) error {
 	}
 	return err
 }
+
+func (t *exampleTracingService) Transfer(ctx context.Context, from string, to string, amount int64) error {
+	ctx, span := t.tracer.Start(ctx, "example.Transfer", trace.WithSpanKind(trace.SpanKindInternal))
+	defer span.End()
+	err := t.next.Transfer(ctx, from, to, amount)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	return err
+}

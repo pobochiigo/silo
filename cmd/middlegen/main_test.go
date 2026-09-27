@@ -81,6 +81,7 @@ func TestParseDirectives(t *testing.T) {
 		List: []*ast.Comment{
 			{Text: "// Save stores the user."},
 			{Text: "//middlegen:non-transactional"},
+			{Text: "//middlegen:in-tx"},
 			{Text: "//middlegen:echo user, other"},
 			{Text: "//middlegen:redact password token"},
 			{Text: "//middlegen:metric attr:user_id = p1"},
@@ -96,6 +97,7 @@ func TestParseDirectives(t *testing.T) {
 
 	d := parseDirectives(doc, line, "middlegen")
 	assert.True(t, d.nonTransactional)
+	assert.True(t, d.inTx)
 	assert.Equal(t, []string{"user", "other"}, d.echo)
 	assert.False(t, d.echoNone)
 	assert.Equal(t, map[string]bool{"password": true, "token": true}, d.redact)

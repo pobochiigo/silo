@@ -27,12 +27,14 @@ type Field struct {
 
 // Method is one decorated method with every string the templates need.
 type Method struct {
-	Name                string
-	Params              []Field
-	Results             []Field
-	HasContext          bool
-	HasError            bool
-	NonTransactional    bool
+	Name             string
+	Params           []Field
+	Results          []Field
+	HasContext       bool
+	HasError         bool
+	NonTransactional bool
+	// InTx marks a service method that runs in Manager.RunInTx instead of RunWith.
+	InTx                bool
 	ParamsSignature     string
 	ParamsNames         string
 	ResultsSignature    string
@@ -63,6 +65,7 @@ func (g *generator) buildMethod(fn *types.Func, ifaceName string) (Method, error
 	m := Method{
 		Name:             fn.Name(),
 		NonTransactional: d.nonTransactional,
+		InTx:             d.inTx,
 		CustomAttributes: d.attrs,
 		counterMetrics:   d.counters,
 	}

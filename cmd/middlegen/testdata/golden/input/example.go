@@ -45,4 +45,8 @@ type Example interface {
 
 	// blank parameter name, context not in first position
 	Tag(_ string, ctx context.Context) error
+
+	// uow_service: wrapped in RunInTx instead of RunWith
+	//middlegen:in-tx
+	Transfer(ctx context.Context, from, to string, amount int64) error
 }

@@ -22,7 +22,9 @@ type {{.InterfaceNameLower}}UoWMiddleware struct {
 {{range .Methods}}
 func (m *{{$.InterfaceNameLower}}UoWMiddleware) {{.Name}}({{.ParamsSignature}}) {{.ResultsSignature}} {
 {{- if and .HasContext (not .NonTransactional)}}
-	if uowInstance, ok := uow.Extract(ctx); ok {
+	// Queued while the unit of work's transaction is not open yet (RunWith);
+	// executed immediately inside an open transaction (RunInTx, deferred tasks).
+	if uowInstance, ok := uow.Extract(ctx); ok && !uow.InTransaction(ctx) {
 		uowInstance.Defer(func(txCtx context.Context) error {
 			{{.RepoDeferStmt}}
 		})

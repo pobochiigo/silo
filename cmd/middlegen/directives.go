@@ -12,6 +12,7 @@ import (
 // methodDirectives holds the parsed //<prefix>:... comments of one method.
 type methodDirectives struct {
 	nonTransactional bool
+	inTx             bool
 	echo             []string
 	echoNone         bool
 	redact           map[string]bool
@@ -105,6 +106,8 @@ func parseDirectives(doc *ast.CommentGroup, line *ast.CommentGroup, prefix strin
 		switch directive {
 		case "non-transactional":
 			d.nonTransactional = true
+		case "in-tx":
+			d.inTx = true
 		case "echo":
 			if arg == "none" {
 				d.echoNone = true
