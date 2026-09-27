@@ -8,9 +8,10 @@
 // declared in another package cannot be implemented from the generated
 // package; they are forwarded through the embedded interface instead.
 //
-// Directives are comments on interface methods, prefixed by -prefix
-// (default "middlegen"). Directives written on an embedded interface's
-// methods apply wherever that interface is embedded.
+// Directives are comments on interface methods, in the method's doc comment
+// or its trailing line comment, prefixed by -prefix (default "middlegen").
+// Directives written on an embedded interface's methods apply wherever that
+// interface is embedded.
 //
 //	//middlegen:non-transactional          run the repository method immediately, never defer it
 //	//middlegen:echo <param>[, <param>...]  return these parameters, in order, as the deferred
