@@ -514,21 +514,23 @@ func TestRunInTx_RetryRerunsWholeAction(t *testing.T) {
 	assert.Equal(t, int32(2), atomic.LoadInt32(&transactor.beginCalls))
 }
 
-func TestRunInTx_NestedJoinsOuterUnit(t *testing.T) {
+func TestRunInTx_RefusesUnitWithoutTransaction(t *testing.T) {
 	transactor := &mockTransactor{}
 	m := NewManager(transactor)
 
+	// A unit injected by hand (or by a RunWith action) has no open
+	// transaction, so RunInTx cannot deliver the isolation it promises.
 	outer := NewUnitOfWork()
 	ctx := Inject(context.Background(), outer)
 
+	var ran bool
 	err := m.RunInTx(ctx, func(uowCtx context.Context) error {
-		extracted, ok := Extract(uowCtx)
-		require.True(t, ok)
-		assert.Same(t, outer, extracted)
+		ran = true
 		return nil
 	})
 
-	assert.NoError(t, err)
+	assert.ErrorIs(t, err, ErrNoTransaction)
+	assert.False(t, ran)
 	assert.Equal(t, int32(0), transactor.beginCalls, "nested call must not open its own transaction")
 }
 
