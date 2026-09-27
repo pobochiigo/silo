@@ -1,5 +1,7 @@
 # Repository review: `github.com/pobochiigo/silo`
 
+> A second review at v0.1.0, focused on transaction propagation, is in [review-v0.1.0.md](review-v0.1.0.md).
+
 Reviewed at commit `ac771b3` (2026-09-27). Scope: every non-test Go file in the
 module, the tests, the README, and the CI workflow. All findings marked
 **verified** were reproduced by generating code with `middlegen` and compiling

@@ -18,15 +18,42 @@ Silo requires Go 1.27.1 or newer.
 go get github.com/pobochiigo/silo
 ```
 
-The middleware generator is a separate binary. Install it at the library version your module uses, since the generated code calls into the library:
+The middleware generator is a separate program whose output calls into the library, so keep the two at the same version. The simplest way is to record it as a Go tool in your `go.mod`:
+```bash
+go get -tool github.com/pobochiigo/silo/cmd/middlegen@latest
+```
+```go
+//go:generate go tool middlegen -type=UserRepository -kinds=uow_repo,logging,tracing
+```
+`go tool` builds the generator from the version pinned in `go.mod`, so every developer and CI run uses the same one. Two alternatives: install a binary at the library version your module uses,
 ```bash
 go install github.com/pobochiigo/silo/cmd/middlegen@$(go list -m -f '{{.Version}}' github.com/pobochiigo/silo)
 ```
-
-Or skip the install and let `go generate` fetch it, pinned, on demand:
+or let `go generate` fetch a pinned version on demand:
 ```go
 //go:generate go run github.com/pobochiigo/silo/cmd/middlegen@v0.1.0 -type=UserRepository -kinds=uow_repo,logging,tracing
 ```
+
+---
+
+## Examples
+
+The [`examples`](examples/) directory is a separate Go module with runnable programs, built and run against the library in CI:
+
+| Example | Shows |
+|---|---|
+| [`examples/middlegen`](examples/middlegen/) | Every directive on one interface, all four kinds of generated middleware, when deferred writes really execute, generation into another package. Runs without any infrastructure. |
+| [`examples/uow`](examples/uow/) | A ledger service on database/sql, sqlx and pgx with the same generated middlewares; `RunWith` deferral, `RunInTx` with `//middlegen:in-tx`, SERIALIZABLE retries under concurrency and the nesting rules, against PostgreSQL. |
+| [`examples/telemetry`](examples/telemetry/) | `InitTelemetry`, the go-kit endpoint middlewares, trace propagation over HTTP and gRPC metadata, the go-kit log adapter and the fan-out handler. |
+| [`examples/connectrpc`](examples/connectrpc/) | A Connect RPC served from a type-safe endpoint and called through a type-safe client endpoint. |
+
+```bash
+cd examples
+go run ./middlegen                      # no infrastructure needed
+docker compose up -d && go run ./uow    # PostgreSQL and an OTel Collector
+```
+
+See [`examples/README.md`](examples/README.md) for the details.
 
 ---
 
@@ -46,6 +73,7 @@ silo/
 ├── db/                  # SQL, sqlx and pgx database transaction adapters
 ├── docs/                # Design notes and review history
 ├── endpoint/            # Generic, type-safe endpoint signature
+├── examples/            # Runnable examples (separate Go module)
 ├── middleware/          # Generic middleware type definitions
 ├── telemetry/           # OpenTelemetry trackers, exporters, and middlewares
 └── uow/                 # Core Unit of Work transaction orchestrator
@@ -80,8 +108,8 @@ The transaction, its isolation level and the retries therefore cover the deferre
 
 ### `RunInTx`: everything inside the transaction
 
-1. The transaction is opened **first**. The action runs with a context carrying both the transaction and a fresh unit of work, so repository reads (and any immediate writes) execute inside the transaction under its isolation level.
-2. Deferred tasks run in the same transaction after the action returns `nil`, then the transaction is committed.
+1. The transaction is opened **first**. The action runs with a context carrying both the transaction and a fresh unit of work, so repository reads and writes execute inside the transaction under its isolation level. `uow.InTransaction(ctx)` is true here, and the generated `uow_repo` middleware therefore executes writes immediately instead of queueing them: the caller gets the implementation's real results and later reads see the writes.
+2. Tasks deferred by hand through `UnitOfWork.Defer` run in the same transaction after the action returns `nil`, then the transaction is committed.
 3. On a retryable error the **whole action** is re-run in a fresh transaction. The action must therefore be safe to repeat with respect to side effects outside the database.
 
 Use `RunInTx` for read-modify-write logic that must be isolated; use `RunWith` when the action is pure computation plus writes and you want to avoid holding a transaction open.
@@ -102,9 +130,21 @@ err := manager.RunWith(ctx, func(ctx context.Context) error {
 })
 ```
 
-### Nesting and multiple databases
+### Nesting
 
-A nested `RunWith`/`RunInTx` call (a context that already carries a unit of work) joins the outer boundary: it runs immediately and its deferred tasks are committed by the outer call. The `db` package stores one active transaction per context, so nesting boundaries that belong to **different databases** is not supported: the inner tasks would run against the outer transaction.
+Boundaries nest by joining what the context already carries. The three cases:
+
+| The context carries | `RunWith` | `RunInTx` |
+|---|---|---|
+| A unit of work **and** an open transaction (inside a `RunInTx` action) | Joins: runs the action now; deferred work belongs to the outer unit. | Joins the same way. |
+| A unit of work but **no transaction yet** (inside a `RunWith` action) | Joins. | Returns `uow.ErrNoTransaction`: it cannot deliver the isolation it promises. Make the outer boundary `RunInTx` (with `middlegen`, mark the service method `//middlegen:in-tx`). |
+| An open transaction but **no unit of work** (inside a deferred task) | Runs the action in that transaction with a fresh unit whose tasks run right after it; the outer boundary commits. | Same. |
+
+A second transaction is never opened inside a first one. `uow.InTransaction(ctx)` tells any code which situation it is in. A task that calls `Defer` on the unit that is executing it, or a goroutine that outlives the action and defers late, is reported with `uow.ErrLateDefer` instead of being silently dropped. Contexts handed to actions and tasks must not outlive their boundary.
+
+### Multiple databases
+
+The `db` package stores one active transaction per context, so nesting boundaries that belong to **different databases** is not supported: the inner tasks would run against the outer transaction. Its executor helpers refuse to hand out a pool while a transaction of the other driver family is active in the context (see [Choosing a Transactor](#choosing-a-transactor)).
 
 ### Retrying serialization failures
 
@@ -146,7 +186,7 @@ type User struct {
 	Name string
 }
 
-//go:generate middlegen -type=UserRepository -kinds=uow_repo,logging,tracing
+//go:generate go tool middlegen -type=UserRepository -kinds=uow_repo,logging,tracing
 type UserRepository interface {
 	//middlegen:non-transactional
 	GetByID(ctx context.Context, id string) (*User, error)
@@ -185,7 +225,7 @@ func (r *postgresUserRepository) Save(ctx context.Context, user *User) (*User, e
 
 ### Step 2: Define the Service & Annotate for `middlegen`
 
-The service layer orchestrates business logic and manages the Unit of Work lifecycle boundaries. We use the `uow_service` kind to auto-wrap service execution in `uow.Manager.RunWith` boundaries: writes queued by the repository are committed in one transaction when the service method returns, with automatic retries of transient failures.
+The service layer orchestrates business logic and manages the Unit of Work lifecycle boundaries. We use the `uow_service` kind to auto-wrap service execution in `uow.Manager.RunWith` boundaries: writes queued by the repository are committed in one transaction when the service method returns, with automatic retries of transient failures. A method that must read and write under one isolation level is marked `//middlegen:in-tx` and wrapped in `RunInTx` instead.
 
 `service/user_service.go`:
 ```go
@@ -197,7 +237,7 @@ import (
 	mydb "my-app/db"
 )
 
-//go:generate middlegen -type=UserService -kinds=uow_service,logging,tracing
+//go:generate go tool middlegen -type=UserService -kinds=uow_service,logging,tracing
 type UserService interface {
 	CreateUser(ctx context.Context, id string, name string) error
 }
@@ -230,7 +270,7 @@ Run Go generate from your shell:
 ```bash
 go generate ./...
 ```
-The `//go:generate middlegen` lines expect the binary on your `PATH` (`go install` puts it in `$(go env GOPATH)/bin`); the `go run ...@v0.1.0` form from [Installation](#installation) needs nothing installed. Regenerating is always safe: previously generated `.gen.go` files are ignored while the package is loaded, so stale output that no longer compiles does not block the generator.
+The `//go:generate go tool middlegen` lines use the generator recorded in `go.mod` (see [Installation](#installation)); with an installed binary write `//go:generate middlegen ...` instead, and with neither use the `go run ...@v0.1.0` form. Regenerating is always safe: previously generated `.gen.go` files are ignored while the package is loaded, so stale output that no longer compiles does not block the generator.
 
 This automatically produces the following decorators inside your package directories:
 - `user_repository_logging_middleware.gen.go`
@@ -329,7 +369,9 @@ The `db` package ships three `uow.Transactor` adapters. Pick the one matching ho
 |---|---|---|
 | `db.NewSQLTransactor(db)` | `*sql.Tx` | Repositories use plain `database/sql` via `db.Executor`. |
 | `db.NewSQLXTransactor(sqlxDB)` | `*sqlx.Tx` | Repositories use `sqlx` via `db.XExecutor` — required for named queries (`NamedExecContext`, `Rebind`), which need the driver's bindvar type. |
-| `db.NewPGXTransactor(pool)` | `pgx.Tx` | Repositories use native `pgx` via `db.PGXExecutor`. |
+| `db.NewPGXTransactor(pool)` | `pgx.Tx` | Repositories use native `pgx` via `db.PGXExecutor`. `db.PGXCommon` covers `Exec`, `Query`, `QueryRow`, `SendBatch` and `CopyFrom`, so batches and COPY run inside the transaction too. |
+
+Each family lives in its own file of the `db` package (`sql.go`, `sqlx.go`, `pgx.go`), and the database/sql and sqlx transactors share one context key so a plain `database/sql` repository works inside a transaction begun by `SQLXTransactor` and vice versa. The pgx transactor uses its own key. The executor helpers never hand out the pool while a transaction of the **other** family is active in the context: `db.Executor` and `db.XExecutor` panic when they find a pgx transaction, and `db.PGXExecutor` panics when it finds a database/sql one. That mismatch means the repository and the transactor were built for different drivers, and running the statement on the pool would silently put it outside the transaction. Code that intentionally targets another database from inside a unit of work uses its own pool directly instead of an executor helper.
 
 > **Note:** `db.XExecutor` can also wrap a plain `*sql.Tx` (begun by `SQLTransactor`) on the fly, inheriting the name mapper of a `*sqlx.DB` fallback (or sqlx's default mapper otherwise), but that wrapper has no driver name, so named queries would render `?` placeholders and fail on Postgres. Use `SQLXTransactor` if you need named queries inside transactions. `XExecutor` panics if the context carries an executor it cannot adapt, rather than silently running your statements outside the transaction.
 
@@ -373,6 +415,7 @@ Directives are comments on the methods of the interface, written `//<prefix>:<di
 | Directive | Applies to | Effect |
 |---|---|---|
 | `//middlegen:non-transactional` | `uow_repo` | Run the method immediately even inside a unit of work. Use it for reads. |
+| `//middlegen:in-tx` | `uow_service` | Wrap the method in `Manager.RunInTx` (transaction opened first, whole method isolated and retried) instead of the deferred-write `RunWith`. |
 | `//middlegen:echo <param>[, <param>...]` | `uow_repo` | Return the named parameters, in order, as the deferred method's non-error results. `echo none` disables echoing. |
 | `//middlegen:redact <param>[, <param>...]` | `logging` | Log the named parameters as `[REDACTED]`. |
 | `//middlegen:metric attr:<name>=<expr>` | `metrics` | Add a metric attribute computed from a Go expression over the parameters. |
@@ -403,7 +446,7 @@ type Reader interface {
 	List(ctx context.Context, limit int) ([]Account, error) //middlegen:non-transactional
 }
 
-//go:generate middlegen -type=Repository -kinds=uow_repo,logging,tracing,metrics -service=accounts
+//go:generate go tool middlegen -type=Repository -kinds=uow_repo,logging,tracing,metrics -service=accounts
 type Repository interface {
 	Reader
 
@@ -426,7 +469,7 @@ type Repository interface {
 }
 ```
 
-**`uow_repo`** (`repository_uow_middleware.gen.go`): reads run immediately, writes are queued on the unit of work found in the context, and the caller gets its own object back. Without a unit of work in the context every method is a plain pass-through.
+**`uow_repo`** (`repository_uow_middleware.gen.go`): reads run immediately; writes are queued on the unit of work found in the context while its transaction is not open yet (a `RunWith` action), and the caller gets its own object back. Inside an open transaction (a `RunInTx` action, or a deferred task) and without a unit of work in the context, every method is a plain pass-through.
 
 ```go
 func (m *repositoryUoWMiddleware) GetByID(ctx context.Context, id string) (*Account, error) {
@@ -434,7 +477,9 @@ func (m *repositoryUoWMiddleware) GetByID(ctx context.Context, id string) (*Acco
 }
 
 func (m *repositoryUoWMiddleware) Save(ctx context.Context, acc *Account) (*Account, error) {
-	if uowInstance, ok := uow.Extract(ctx); ok {
+	// Queued while the unit of work's transaction is not open yet (RunWith);
+	// executed immediately inside an open transaction (RunInTx, deferred tasks).
+	if uowInstance, ok := uow.Extract(ctx); ok && !uow.InTransaction(ctx) {
 		uowInstance.Defer(func(txCtx context.Context) error {
 			_, err := m.next.Save(txCtx, acc)
 			return err
@@ -445,7 +490,9 @@ func (m *repositoryUoWMiddleware) Save(ctx context.Context, acc *Account) (*Acco
 }
 
 func (m *repositoryUoWMiddleware) Merge(ctx context.Context, src *Account, dst *Account) (*Account, error) {
-	if uowInstance, ok := uow.Extract(ctx); ok {
+	// Queued while the unit of work's transaction is not open yet (RunWith);
+	// executed immediately inside an open transaction (RunInTx, deferred tasks).
+	if uowInstance, ok := uow.Extract(ctx); ok && !uow.InTransaction(ctx) {
 		uowInstance.Defer(func(txCtx context.Context) error {
 			_, err := m.next.Merge(txCtx, src, dst)
 			return err
@@ -456,7 +503,9 @@ func (m *repositoryUoWMiddleware) Merge(ctx context.Context, src *Account, dst *
 }
 
 func (m *repositoryUoWMiddleware) RotateKey(ctx context.Context, id string, secret string) (string, error) {
-	if uowInstance, ok := uow.Extract(ctx); ok {
+	// Queued while the unit of work's transaction is not open yet (RunWith);
+	// executed immediately inside an open transaction (RunInTx, deferred tasks).
+	if uowInstance, ok := uow.Extract(ctx); ok && !uow.InTransaction(ctx) {
 		uowInstance.Defer(func(txCtx context.Context) error {
 			_, err := m.next.RotateKey(txCtx, id, secret)
 			return err
@@ -467,7 +516,9 @@ func (m *repositoryUoWMiddleware) RotateKey(ctx context.Context, id string, secr
 }
 
 func (m *repositoryUoWMiddleware) Delete(ctx context.Context, id string, reason string) error {
-	if uowInstance, ok := uow.Extract(ctx); ok {
+	// Queued while the unit of work's transaction is not open yet (RunWith);
+	// executed immediately inside an open transaction (RunInTx, deferred tasks).
+	if uowInstance, ok := uow.Extract(ctx); ok && !uow.InTransaction(ctx) {
 		uowInstance.Defer(func(txCtx context.Context) error {
 			return m.next.Delete(txCtx, id, reason)
 		})
@@ -550,8 +601,8 @@ Every kind produces one file, `<iface><suffix>`, where `<iface>` is the interfac
 | `logging` | `<Iface>LoggingMiddleware()` | `_logging_middleware.gen.go` | `slog.Default()` (captured when the constructor runs) with `service=<service>`. `<Method> started` at `Debug` with every parameter, `<Method> failed` at `Error` with `error`. Methods with a context use the `*Context` variants so records carry the trace and span IDs. |
 | `tracing` | `<Iface>TracingMiddleware()` | `_tracing_middleware.gen.go` | Span `<service>.<Method>` of kind internal from `otel.Tracer(<service>)`; on error `RecordError` and status `Error`. Methods without a context are forwarded unchanged. |
 | `metrics` | `<Iface>MetricsMiddleware()` | `_metrics_middleware.gen.go` | On meter `<service>`: `<iface>_requests_total`, `<iface>_errors_total` and `<iface>_request_duration_seconds` (seconds, `DefaultLatencyBuckets`) with attribute `method` plus the `metric attr` attributes; one `Int64Counter` per `metric counter` name, without attributes. Methods without a context are measured with a background context. |
-| `uow_repo` | `<Iface>UoWMiddleware()` | `_uow_middleware.gen.go` | Methods with a context and without `non-transactional` are queued on the unit of work in the context and return immediately (see [What deferred methods return](#what-deferred-methods-return)); everything else passes through. |
-| `uow_service` | `<Iface>UoWMiddleware(manager *uow.Manager)` | `_uow_middleware.gen.go` | Every method with a context runs inside `manager.RunWith`, so the writes it queues through decorated repositories commit when it returns. A nested call joins the outer unit of work. |
+| `uow_repo` | `<Iface>UoWMiddleware()` | `_uow_middleware.gen.go` | Methods with a context and without `non-transactional` are queued on the unit of work in the context while its transaction is not open yet, and return immediately (see [What deferred methods return](#what-deferred-methods-return)). Inside an open transaction they execute right away; everything else passes through. |
+| `uow_service` | `<Iface>UoWMiddleware(manager *uow.Manager)` | `_uow_middleware.gen.go` | Every method with a context runs inside `manager.RunWith`, or `manager.RunInTx` when marked `//middlegen:in-tx`, so the writes it makes through decorated repositories commit when it returns. A nested call joins the outer boundary (see [Nesting](#nesting)). |
 
 `uow_repo` and `uow_service` write the same file and constructor name, so generate one or the other for a given interface: repositories get `uow_repo`, the services calling them get `uow_service`.
 
@@ -564,7 +615,7 @@ With `-dir`, the interface can live in a different package than the generated de
 // Package decorators holds the middlewares generated for interfaces declared elsewhere.
 package decorators
 
-//go:generate middlegen -type=UserRepository -dir=db -kinds=logging,metrics -service=users
+//go:generate go tool middlegen -type=UserRepository -dir=db -kinds=logging,metrics -service=users
 ```
 
 The generated file belongs to `package decorators`, imports the interface's package, and refers to it qualified:
@@ -583,7 +634,7 @@ A `uow_repo` method that runs inside a unit of work is queued, not executed, so 
 - Otherwise, a result is echoed when **exactly one** parameter has its type (a `*T` parameter also satisfies a `T` result, guarded against `nil`, and vice versa) and that type is not a basic type (`string`, `int`, `bool`, ...). `Save(ctx, user *User) (*User, error)` returns `user`.
 - Every other result is its zero value. Basic-typed results are never echoed from parameters; when several parameters are candidates, the generator warns and returns the zero value until you add an `echo` directive.
 
-Read methods must be annotated `//middlegen:non-transactional` so they execute immediately and return real data.
+Read methods must be annotated `//middlegen:non-transactional` so they execute immediately and return real data. Inside an open transaction (a `RunInTx` action or a deferred task) nothing is deferred, so every method returns the implementation's real results.
 
 ### Notes on generated code
 
