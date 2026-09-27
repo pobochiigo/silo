@@ -39,3 +39,64 @@ jobs:
 
       - name: Vulnerability check
         run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  examples:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: silo
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d silo"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/silo?sslmode=disable
+    defaults:
+      run:
+        working-directory: examples
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: examples/go.mod
+          check-latest: true
+
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+
+      - name: Check go.mod and go.sum are tidy
+        run: go mod tidy && git diff --exit-code -- go.mod go.sum
+
+      - name: Check generated middlewares are current
+        run: go generate ./... && git diff --exit-code
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@2026.2.1 ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Run the middlegen example
+        run: go run ./middlegen
+
+      - name: Run the uow example on every driver
+        run: |
+          for driver in sql sqlx pgx; do
+            go run ./uow -driver "$driver" -workers 4 -transfers 10
+          done
+
+      - name: Run the telemetry example
+        run: go run ./telemetry
+
+      - name: Run the connectrpc example
+        run: go run ./connectrpc

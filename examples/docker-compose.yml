@@ -1,0 +1,27 @@
+# Infrastructure for the examples: PostgreSQL for the uow example and an
+# OpenTelemetry Collector that prints what it receives, for any example run
+# with OTEL_EXPORTER_OTLP_ENDPOINT=localhost:4317.
+#
+#   docker compose up -d
+#   docker compose logs -f otel-collector
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: silo
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d silo"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otel-collector.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otel-collector.yaml:ro
+    ports:
+      - "4317:4317"

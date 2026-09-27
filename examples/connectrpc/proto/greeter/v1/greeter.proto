@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package greeter.v1;
+
+option go_package = "github.com/pobochiigo/silo/examples/connectrpc/gen/greeter/v1;greeterv1";
+
+service GreeterService {
+  rpc Greet(GreetRequest) returns (GreetResponse) {}
+}
+
+message GreetRequest {
+  string name = 1;
+}
+
+message GreetResponse {
+  string greeting = 1;
+}
