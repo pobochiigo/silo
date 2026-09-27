@@ -158,6 +158,22 @@ func TestSlogAdapter(t *testing.T) {
 		assert.Equal(t, "late binding", raw["msg"])
 	})
 
+	t.Run("go-kit timestamp is dropped", func(t *testing.T) {
+		var buf bytes.Buffer
+		adapter := &slogAdapter{
+			ctx:    context.Background(),
+			logger: slog.New(slog.NewJSONHandler(&buf, nil)),
+		}
+
+		require.NoError(t, adapter.Log("ts", "2026-01-01T00:00:00Z", "caller", "main.go:12", "msg", "hello"))
+
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(buf.Bytes(), &raw))
+		assert.NotContains(t, raw, "ts", "slog stamps its own time")
+		assert.Equal(t, "main.go:12", raw["caller"])
+		assert.Contains(t, raw, "time")
+	})
+
 	t.Run("slog fallback and error value as string", func(t *testing.T) {
 		var buf bytes.Buffer
 		h := slog.NewJSONHandler(&buf, nil)

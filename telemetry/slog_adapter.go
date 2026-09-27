@@ -58,6 +58,10 @@ func (a *slogAdapter) Log(keyvals ...any) error {
 			msg = fmt.Sprint(val)
 		case "level":
 			level = a.parseLogLevel(val)
+		case "ts":
+			// go-kit's conventional timestamp duplicates the time slog stamps
+			// on every record.
+			continue
 		case "err", "error":
 			// Normalise both go-kit spellings to a single "error" attribute.
 			attrs = append(attrs, slog.Any("error", val))

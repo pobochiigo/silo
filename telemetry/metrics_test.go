@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -81,4 +82,24 @@ func TestMetricsRecorder(t *testing.T) {
 	assert.True(t, ok)
 	assert.Len(t, errSumData.DataPoints, 1)
 	assert.Equal(t, int64(1), errSumData.DataPoints[0].Value)
+	assert.Equal(t, "{request}", reqMetric.Unit)
+	assert.Equal(t, "{request}", errMetric.Unit)
+
+	// Latency: unit and second-scale buckets, so percentiles are meaningful.
+	latency := metricsMap["my_subsystem_request_duration_seconds"]
+	assert.Equal(t, "s", latency.Unit)
+	hist, ok := latency.Data.(metricdata.Histogram[float64])
+	require.True(t, ok)
+	require.Len(t, hist.DataPoints, 1)
+	assert.Equal(t, DefaultLatencyBuckets, hist.DataPoints[0].Bounds)
+	assert.Equal(t, uint64(2), hist.DataPoints[0].Count)
+	// Both observations took ~100ms: they must land in the 0.1-0.25s bucket,
+	// not in a catch-all first bucket.
+	var bucketIdx int
+	for i, count := range hist.DataPoints[0].BucketCounts {
+		if count == 2 {
+			bucketIdx = i
+		}
+	}
+	assert.Equal(t, 5, bucketIdx, "100ms must fall in the (0.1, 0.25] bucket")
 }
