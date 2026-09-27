@@ -223,6 +223,8 @@ type ShutdownFunc func(context.Context) error
 // values take precedence over the environment, which takes precedence over
 // detection.
 //
+// The resource's schema URL comes from the SDK's own detectors, so it always
+// matches the semantic-conventions version the installed SDK was built with.
 // The environment is emitted under both deployment.environment.name (current
 // semantic conventions) and deployment.environment (pre-1.27 name) so existing
 // dashboards keep working.
@@ -241,10 +243,10 @@ func NewResource(ctx context.Context, cfg Config) (*resource.Resource, error) {
 		)
 	}
 
-	opts := []resource.Option{
-		resource.WithSchemaURL(semconv.SchemaURL),
-		resource.WithTelemetrySDK(),
-	}
+	// No explicit schema URL: the SDK detectors carry the one that matches
+	// their semantic conventions, and pinning a different version here would
+	// make resource.New fail with a schema conflict after an SDK upgrade.
+	opts := []resource.Option{resource.WithTelemetrySDK()}
 	if !cfg.SkipHostDetection {
 		opts = append(opts, resource.WithHost())
 	}
@@ -254,10 +256,16 @@ func NewResource(ctx context.Context, cfg Config) (*resource.Resource, error) {
 	)
 
 	res, err := resource.New(ctx, opts...)
-	if errors.Is(err, resource.ErrPartialResource) {
+	switch {
+	case errors.Is(err, resource.ErrPartialResource):
 		// A detector failed (for example no hostname is available); the
 		// attributes that were detected are still valid.
 		slog.Warn("telemetry: resource detection incomplete", slog.Any("error", err))
+		return res, nil
+	case errors.Is(err, resource.ErrSchemaURLConflict):
+		// Detectors disagreed on the schema version; the merged attributes
+		// are still valid, only the schema URL is dropped.
+		slog.Warn("telemetry: resource schema URL conflict, continuing without one", slog.Any("error", err))
 		return res, nil
 	}
 	return res, err
