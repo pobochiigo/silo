@@ -14,8 +14,10 @@
 // interface is embedded.
 //
 //	//middlegen:non-transactional          run the repository method immediately, never defer it
-//	//middlegen:in-tx                      run the service method in Manager.RunInTx (transaction
-//	                                        opened first) instead of the deferred-write RunWith
+//	//middlegen:in-tx                      run the service method as one task (Manager.RunInTx):
+//	                                        inside the transaction, repository writes executing at
+//	                                        once; queued when called inside a RunWith boundary.
+//	                                        The method must return only an error.
 //	//middlegen:echo <param>[, <param>...]  return these parameters, in order, as the deferred
 //	                                        method's non-error results ("none" disables echoing)
 //	//middlegen:redact <param>[, <param>...] log these parameters as "[REDACTED]"

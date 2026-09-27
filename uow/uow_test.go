@@ -427,7 +427,7 @@ func TestRunWith_TaskErrorIsRetried(t *testing.T) {
 	assert.Equal(t, int32(3), atomic.LoadInt32(&transactor.beginCalls))
 }
 
-func TestRunInTx_ActionRunsInsideTransaction(t *testing.T) {
+func TestRunInTx_TaskRunsInsideTransaction(t *testing.T) {
 	type txKey struct{}
 	tx := &mockTx{}
 	transactor := &mockTransactor{
@@ -437,33 +437,26 @@ func TestRunInTx_ActionRunsInsideTransaction(t *testing.T) {
 	}
 	m := NewManager(transactor)
 
-	var order []string
-	err := m.RunInTx(context.Background(), func(uowCtx context.Context) error {
-		// The transaction is already open and visible to the action.
-		assert.Equal(t, "tx", uowCtx.Value(txKey{}))
+	var ran bool
+	err := m.RunInTx(context.Background(), func(txCtx context.Context) error {
+		// The transaction is already open and visible to the task.
+		assert.Equal(t, "tx", txCtx.Value(txKey{}))
+		assert.True(t, InTransaction(txCtx))
 		assert.Equal(t, int32(1), atomic.LoadInt32(&transactor.beginCalls))
-		order = append(order, "action")
-
-		uowInst, ok := Extract(uowCtx)
-		require.True(t, ok)
-		uowInst.Defer(func(ctx context.Context) error {
-			// Deferred tasks run in the same transaction, after the action.
-			assert.Equal(t, "tx", ctx.Value(txKey{}))
-			_, nested := Extract(ctx)
-			assert.False(t, nested, "task context must not carry the unit of work")
-			order = append(order, "task")
-			return nil
-		})
+		// A task carries no unit of work: decorated writes execute at once.
+		_, ok := Extract(txCtx)
+		assert.False(t, ok, "task context must not carry a unit of work")
+		ran = true
 		return nil
 	})
 
 	require.NoError(t, err)
-	assert.Equal(t, []string{"action", "task"}, order)
+	assert.True(t, ran)
 	assert.Equal(t, int32(1), tx.commitCalls)
 	assert.Equal(t, int32(0), tx.rollbackCalls)
 }
 
-func TestRunInTx_ActionErrorRollsBack(t *testing.T) {
+func TestRunInTx_TaskErrorRollsBack(t *testing.T) {
 	tx := &mockTx{}
 	transactor := &mockTransactor{
 		beginTxFunc: func(ctx context.Context) (Tx, context.Context, error) {
@@ -472,8 +465,8 @@ func TestRunInTx_ActionErrorRollsBack(t *testing.T) {
 	}
 	m := NewManager(transactor)
 
-	expectedErr := errors.New("action failed")
-	err := m.RunInTx(context.Background(), func(uowCtx context.Context) error {
+	expectedErr := errors.New("task failed")
+	err := m.RunInTx(context.Background(), func(context.Context) error {
 		return expectedErr
 	})
 
@@ -483,9 +476,9 @@ func TestRunInTx_ActionErrorRollsBack(t *testing.T) {
 	assert.Equal(t, int32(1), tx.rollbackCalls)
 }
 
-func TestRunInTx_RetryRerunsWholeAction(t *testing.T) {
+func TestRunInTx_RetryRerunsTheTask(t *testing.T) {
 	transient := errors.New("could not serialize access")
-	var actionRuns, commits int32
+	var taskRuns, commits int32
 
 	transactor := &mockTransactor{
 		beginTxFunc: func(ctx context.Context) (Tx, context.Context, error) {
@@ -504,33 +497,34 @@ func TestRunInTx_RetryRerunsWholeAction(t *testing.T) {
 		WithRetryDelay(time.Millisecond, time.Millisecond),
 	)
 
-	err := m.RunInTx(context.Background(), func(uowCtx context.Context) error {
-		atomic.AddInt32(&actionRuns, 1)
+	err := m.RunInTx(context.Background(), func(context.Context) error {
+		atomic.AddInt32(&taskRuns, 1)
 		return nil
 	})
 
 	require.NoError(t, err)
-	assert.Equal(t, int32(2), atomic.LoadInt32(&actionRuns), "action re-runs on retry")
+	assert.Equal(t, int32(2), atomic.LoadInt32(&taskRuns), "task re-runs on retry")
 	assert.Equal(t, int32(2), atomic.LoadInt32(&transactor.beginCalls))
 }
 
-func TestRunInTx_RefusesUnitWithoutTransaction(t *testing.T) {
+func TestRunInTx_InsideUnitIsQueued(t *testing.T) {
 	transactor := &mockTransactor{}
 	m := NewManager(transactor)
 
-	// A unit injected by hand (or by a RunWith action) has no open
-	// transaction, so RunInTx cannot deliver the isolation it promises.
-	outer := NewUnitOfWork()
-	ctx := Inject(context.Background(), outer)
+	// A unit injected by hand, as a RunWith action would carry: the task is
+	// queued on it and nothing runs or opens until that boundary executes.
+	unit := NewUnitOfWork()
+	ctx := Inject(context.Background(), unit)
 
 	var ran bool
-	err := m.RunInTx(ctx, func(uowCtx context.Context) error {
+	err := m.RunInTx(ctx, func(context.Context) error {
 		ran = true
 		return nil
 	})
 
-	assert.ErrorIs(t, err, ErrNoTransaction)
+	require.NoError(t, err)
 	assert.False(t, ran)
+	assert.Equal(t, 1, unit.count(), "the task is queued on the unit in the context")
 	assert.Equal(t, int32(0), transactor.beginCalls, "nested call must not open its own transaction")
 }
 

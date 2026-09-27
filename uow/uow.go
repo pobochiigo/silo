@@ -2,37 +2,34 @@
 // database tasks that a Manager executes inside a single transaction, with
 // configurable retries for transient failures.
 //
-// # Execution models
+// # The model
 //
-// Manager offers two entry points that differ in when the transaction is
-// opened:
+// A boundary opened with [Manager.RunWith] runs a business action first,
+// outside any transaction, with a context that carries a [UnitOfWork]. The
+// action queues writes through [UnitOfWork.Defer] (the middlegen "uow_repo"
+// wrappers do this for every decorated write). When the action returns, a
+// transaction is opened, the queued tasks run inside it in order, and it
+// commits. Nothing is opened when nothing was queued, and a retry re-runs
+// the tasks only.
 //
-//   - [Manager.RunWith] (deferred-write model): the business action runs
-//     first, outside any transaction, and queues writes through
-//     [UnitOfWork.Defer]. A transaction is opened only after the action
-//     returns, and only the queued tasks run inside it. Reads performed by
-//     the action are not isolated, and a retry re-runs the queued closures
-//     with whatever values they captured. This is the cheapest model and the
-//     one the middlegen "uow_repo"/"uow_service" wrappers target by default.
-//   - [Manager.RunInTx] (transactional model): the transaction is opened
-//     first and the action runs inside it, so reads, immediate writes and
-//     deferred tasks all share the transaction and its isolation level. A
-//     retry re-runs the whole action in a fresh transaction.
+// A task is the unit of transactional code: it runs with the transaction
+// open and no UnitOfWork in its context, so repository calls made from a
+// task execute immediately, inside the transaction, and return real results.
+// [Manager.RunInTx] runs one function as such a task, on its own when no
+// boundary is open, or queued on the boundary the context carries.
 //
 // # Nesting
 //
 // Boundaries nest by joining what the context already carries:
 //
-//   - A UnitOfWork and an open transaction (a RunInTx action, or a boundary
-//     joined inside one): RunWith and RunInTx run their action immediately;
-//     work it defers belongs to the outer unit.
-//   - A UnitOfWork but no transaction yet (a RunWith action): RunWith joins.
-//     RunInTx cannot provide the transaction it promises and returns
-//     [ErrNoTransaction]; make the outer boundary RunInTx instead.
-//   - An open transaction but no UnitOfWork (a deferred task): RunWith and
-//     RunInTx run their action inside that transaction with a fresh unit whose
-//     tasks run right after the action, and leave the commit to the outer
-//     boundary.
+//   - A UnitOfWork (a RunWith action): RunWith runs its action immediately
+//     and the work it defers belongs to that unit. RunInTx queues its task on
+//     that unit and returns nil at once; the task runs in the boundary's
+//     transaction and its error is returned by the boundary.
+//   - An open transaction but no UnitOfWork (a task): RunInTx runs its task
+//     now. RunWith runs its action inside that transaction with a fresh unit
+//     whose tasks run right after the action, and leaves the commit to the
+//     outer boundary.
 //
 // [InTransaction] reports whether a context carries an open transaction. A
 // context handed to an action or a task must not outlive its boundary.
@@ -58,18 +55,10 @@ type uowKey struct{}
 
 type txKey struct{}
 
-// ErrNoTransaction is returned by [Manager.RunInTx] when it is called inside
-// a RunWith boundary: the outer action runs before its transaction is opened,
-// so the inner action could not run inside one. Make the outer boundary
-// RunInTx (with middlegen, mark the service method //middlegen:in-tx) or move
-// the transactional work out of the RunWith action.
-var ErrNoTransaction = errors.New("uow: RunInTx called inside a RunWith boundary whose transaction is not open yet")
-
 // ErrLateDefer is returned when tasks were queued on a unit of work after it
-// had started executing its tasks, typically by a task itself or by a
-// goroutine that outlived the action. Those tasks never run; defer from the
-// action instead, or call the repository directly from the task, where the
-// transaction is already open.
+// had started executing its tasks, typically by a goroutine that outlived the
+// action. Those tasks never run; defer from the action instead. A task itself
+// needs no Defer: the transaction is open, so it calls the repository directly.
 var ErrLateDefer = errors.New("uow: Defer called while the unit of work was executing its tasks")
 
 // Inject injects the Unit of Work into the context.
@@ -84,8 +73,8 @@ func Extract(ctx context.Context) (*UnitOfWork, bool) {
 }
 
 // InTransaction reports whether ctx carries a database transaction opened by
-// a Manager. It is true for the context a RunInTx action receives and for
-// the context deferred tasks run with, and false inside a RunWith action.
+// a Manager. It is true for the context tasks run with, RunInTx's included,
+// and false inside a RunWith action.
 // The Manager uses it to decide how a nested boundary joins; callers can use
 // it to assert where their code runs.
 func InTransaction(ctx context.Context) bool {
@@ -213,7 +202,7 @@ func NewManager(database Transactor, opts ...Option) *Manager {
 	return m
 }
 
-// RunWith runs a business action in the deferred-write model:
+// RunWith runs a business action as a unit of work boundary:
 //
 //  1. action runs immediately with a context that carries a new UnitOfWork
 //     but no database transaction. Repository reads made here go straight to
@@ -226,13 +215,15 @@ func NewManager(database Transactor, opts ...Option) *Manager {
 //     re-run, so the closures execute with the values captured in step 1.
 //
 // The transaction and its isolation level therefore cover the deferred writes
-// only. Read-modify-write logic that must be isolated belongs in [Manager.RunInTx].
+// only. A check that a write depends on belongs in the write itself (a
+// conditional UPDATE) or in a task, where the transaction is open; see
+// [Manager.RunInTx].
 //
 // When ctx already carries a UnitOfWork, action joins it: it runs immediately
 // and its deferred tasks are committed by the outer boundary. When ctx carries
-// an open transaction but no UnitOfWork (inside a deferred task), action runs
-// in that transaction with a fresh unit whose tasks run right after it, and
-// the outer boundary commits.
+// an open transaction but no UnitOfWork (inside a task), action runs in that
+// transaction with a fresh unit whose tasks run right after it, and the outer
+// boundary commits.
 func (m *Manager) RunWith(ctx context.Context, action ActionFn) error {
 	if _, ok := Extract(ctx); ok {
 		return action(ctx)
@@ -258,45 +249,41 @@ func (m *Manager) RunWith(ctx context.Context, action ActionFn) error {
 	})
 }
 
-// RunInTx runs a business action in the transactional model:
+// RunInTx runs task as the single task of a unit of work:
 //
-//  1. A transaction is opened first. action runs with a context that carries
-//     both the transaction, so repository reads execute inside it under its
-//     isolation level, and a new UnitOfWork. Writes made through the
-//     generated uow_repo middleware are queued exactly as in RunWith.
-//  2. The queued tasks run in the same transaction after action returns nil,
-//     then the transaction is committed. An error from action rolls back.
-//  3. If any step fails with an error the retry evaluator accepts, the whole
-//     action is re-run in a fresh transaction. action must therefore be safe
-//     to repeat with respect to side effects outside the database.
+//  1. A transaction is opened first and task runs with a context that carries
+//     it. That context carries no UnitOfWork, so repository calls made through
+//     the generated uow_repo middleware execute immediately, inside the
+//     transaction, and return real results; reads run under the transaction's
+//     isolation level.
+//  2. The transaction is committed when task returns nil and rolled back when
+//     it returns an error.
+//  3. If task or the commit fails with an error the retry evaluator accepts,
+//     task is re-run in a fresh transaction. It must therefore be safe to
+//     repeat, which in practice means it only talks to the database.
 //
-// When ctx already carries an open transaction, action joins it and no
-// transaction is opened here: inside a RunInTx action it shares the outer
-// unit; inside a deferred task it gets a fresh unit whose tasks run right
-// after it. When ctx carries a UnitOfWork whose transaction is not open yet
-// (a RunWith action), RunInTx returns [ErrNoTransaction] rather than run the
-// action without the isolation it promises.
-func (m *Manager) RunInTx(ctx context.Context, action ActionFn) error {
-	if _, ok := Extract(ctx); ok {
-		if !InTransaction(ctx) {
-			return ErrNoTransaction
-		}
-		return action(ctx)
+// When ctx carries a UnitOfWork (inside a [Manager.RunWith] action), task is
+// queued on it and RunInTx returns nil immediately: the task runs in that
+// boundary's transaction, in Defer order, and its error is returned by the
+// boundary. When ctx carries an open transaction and no UnitOfWork (inside a
+// task), task runs now.
+func (m *Manager) RunInTx(ctx context.Context, task TaskFn) error {
+	if unit, ok := Extract(ctx); ok {
+		unit.Defer(task)
+		return nil
 	}
 	if InTransaction(ctx) {
-		return runJoined(ctx, action)
+		return task(ctx)
 	}
 
 	return m.withRetry(ctx, func(ctx context.Context) error {
-		return m.inTransaction(ctx, func(txCtx context.Context) error {
-			return runJoined(txCtx, action)
-		})
+		return m.inTransaction(ctx, task)
 	})
 }
 
-// runJoined runs action inside the open transaction txCtx carries, with a
-// fresh unit of work, then runs the tasks action deferred in the same
-// transaction. Committing is left to whoever opened the transaction.
+// runJoined runs a RunWith action inside the open transaction txCtx carries,
+// with a fresh unit of work, then runs the tasks the action deferred in the
+// same transaction. Committing is left to whoever opened the transaction.
 func runJoined(txCtx context.Context, action ActionFn) error {
 	unit := NewUnitOfWork()
 	if err := action(Inject(txCtx, unit)); err != nil {

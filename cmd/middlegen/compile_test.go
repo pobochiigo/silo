@@ -329,34 +329,33 @@ func TestDeferredReturnValues(t *testing.T) {
 	}
 }
 
-func TestWritesAreQueuedInsideRunInTxToo(t *testing.T) {
+func TestWritesRunImmediatelyInsideRunInTx(t *testing.T) {
 	s := newSpy()
 	r := RepoUoWMiddleware()(s)
 	m := uow.NewManager(fakeTransactor{})
 
+	// A RunInTx task runs with the transaction open and no unit of work in
+	// its context, so a decorated write executes right away and the caller
+	// gets the implementation's result, not an echoed input.
 	in := &Thing{ID: "a"}
 	err := m.RunInTx(context.Background(), func(ctx context.Context) error {
 		got, err := r.Create(ctx, in, "x")
 		if err != nil {
 			return err
 		}
-		if s.calls["Create"] != 0 {
-			t.Fatal("Create ran during the action; writes must stay queued inside RunInTx")
+		if s.calls["Create"] != 1 {
+			t.Fatal("Create must execute immediately inside a RunInTx task")
 		}
-		if got != in {
-			t.Fatalf("Create returned %v, want the echoed input while queued", got)
+		if got == nil || got.ID != "db-a" {
+			t.Fatalf("Create returned %v, want the implementation's result", got)
 		}
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.calls["Create"] != 1 {
-		t.Fatalf("Create ran %d times after the action, want 1 (inside the same transaction)", s.calls["Create"])
-	}
 
-	// A deferred task runs with the transaction open and no unit of work in
-	// its context, so a decorated call made from it executes right away.
+	// The same holds for a task deferred by hand.
 	s = newSpy()
 	r = RepoUoWMiddleware()(s)
 	err = m.RunWith(context.Background(), func(ctx context.Context) error {
@@ -416,7 +415,8 @@ type Service interface {
 	Register(ctx context.Context, name string) (string, error)
 	Stats(ctx context.Context) (int, bool, error)
 
-	// opened as a transaction first, so reads and writes share it
+	// runs as one task: inside the transaction, queued when called from a
+	// RunWith boundary
 	//middlegen:in-tx
 	Transfer(ctx context.Context, from string, to string, amount int) error
 }
@@ -435,26 +435,30 @@ import (
 	"github.com/pobochiigo/silo/uow"
 )
 
-type spy struct{}
+type spy struct{ transfers int }
 
-func (spy) Ping() error { return nil }
-func (spy) Rename(ctx context.Context, name string) string {
+func (*spy) Ping() error { return nil }
+func (*spy) Rename(ctx context.Context, name string) string {
 	if u, ok := uow.Extract(ctx); ok {
 		u.Defer(func(context.Context) error { return nil })
 	}
 	return name
 }
-func (spy) Fire(ctx context.Context) {
+func (*spy) Fire(ctx context.Context) {
 	if u, ok := uow.Extract(ctx); ok {
 		u.Defer(func(context.Context) error { return nil })
 	}
 }
-func (spy) Register(context.Context, string) (string, error) { return "id", nil }
-func (spy) Stats(context.Context) (int, bool, error)         { return 1, true, nil }
-func (spy) Transfer(ctx context.Context, _ string, _ string, _ int) error {
+func (*spy) Register(context.Context, string) (string, error) { return "id", nil }
+func (*spy) Stats(context.Context) (int, bool, error)         { return 1, true, nil }
+func (s *spy) Transfer(ctx context.Context, _ string, _ string, _ int) error {
 	if !uow.InTransaction(ctx) {
 		return errors.New("Transfer ran outside a transaction")
 	}
+	if _, ok := uow.Extract(ctx); ok {
+		return errors.New("Transfer ran with a unit of work in its context")
+	}
+	s.transfers++
 	return nil
 }
 
@@ -470,22 +474,42 @@ func (c *countingTransactor) BeginTx(ctx context.Context) (uow.Tx, context.Conte
 	return fakeTx{}, ctx, nil
 }
 
-func TestInTxDirectiveOpensTheTransactionFirst(t *testing.T) {
+func TestInTxDirectiveRunsTheMethodAsOneTask(t *testing.T) {
 	tr := &countingTransactor{}
-	svc := ServiceUoWMiddleware(uow.NewManager(tr))(spy{})
+	m := uow.NewManager(tr)
+	s := &spy{}
+	svc := ServiceUoWMiddleware(m)(s)
 
+	// On its own: the transaction opens first and the body runs inside it.
 	if err := svc.Transfer(context.Background(), "a", "b", 1); err != nil {
 		t.Fatal(err)
 	}
-	if tr.begins != 1 {
-		t.Fatalf("Transfer began %d transactions, want 1 (RunInTx)", tr.begins)
+	if tr.begins != 1 || s.transfers != 1 {
+		t.Fatalf("Transfer began %d transactions and ran %d times, want 1 and 1", tr.begins, s.transfers)
+	}
+
+	// Inside a RunWith boundary: queued, run in that boundary's transaction.
+	err := m.RunWith(context.Background(), func(ctx context.Context) error {
+		if err := svc.Transfer(ctx, "a", "b", 1); err != nil {
+			return err
+		}
+		if s.transfers != 1 {
+			t.Fatal("Transfer called inside a RunWith action must be queued, not run")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.begins != 2 || s.transfers != 2 {
+		t.Fatalf("after the boundary: %d transactions, %d runs, want 2 and 2", tr.begins, s.transfers)
 	}
 
 	// Register is a plain RunWith method: nothing deferred, no transaction.
 	if _, err := svc.Register(context.Background(), "x"); err != nil {
 		t.Fatal(err)
 	}
-	if tr.begins != 1 {
+	if tr.begins != 2 {
 		t.Fatalf("Register must not open a transaction when nothing is deferred, begins=%d", tr.begins)
 	}
 }
@@ -502,7 +526,7 @@ func TestErrorlessMethodsLogUnitOfWorkFailures(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
 	defer slog.SetDefault(prev)
 
-	svc := ServiceUoWMiddleware(uow.NewManager(failingTransactor{}))(spy{})
+	svc := ServiceUoWMiddleware(uow.NewManager(failingTransactor{}))(&spy{})
 
 	svc.Fire(context.Background())
 	if got := svc.Rename(context.Background(), "x"); got != "x" {
