@@ -114,7 +114,14 @@ The transaction, its isolation level and the retries therefore cover the queued 
 
 Called inside a `RunWith` action, `RunInTx` opens nothing: it queues the function on that boundary's unit of work and returns `nil` at once. The function runs in the boundary's transaction, in `Defer` order, and its error is returned by the boundary. Called inside a task, the function runs immediately. See [Nesting](#nesting).
 
-The generated `uow_service` middleware wraps every method in `RunWith`; a method marked `//middlegen:in-tx` runs as one task through `RunInTx` instead. Such a method must return only an `error`, because a queued call returns before its body runs (see the [directives](#directives)).
+The generated `uow_service` middleware wraps every method in `RunWith`; a method marked `//middlegen:in-tx` runs as one task through `RunInTx` instead. Such a method must take a `context.Context` and return only an `error`, because a queued call returns before its body runs (see the [directives](#directives)).
+
+Mark a method `in-tx` when all of the following hold; otherwise keep the boundary:
+
+- It reads and then writes, and no single statement can carry the check. When one can, [put the check in the write](#read-modify-write-put-the-check-in-the-write) instead.
+- It talks only to the database. The transaction stays open for the whole body and a retry runs the body again, so an HTTP call or a message published from it is held for the round trip and repeated.
+- Its callers need nothing back but an error. A boundary that calls it gets `nil` at the call and the error from its own return (see the [flow comparison](#flow-comparison-a-service-calling-a-service)).
+- It is short: it holds a connection and its locks from `BEGIN` to `COMMIT`.
 
 ### Read-modify-write: put the check in the write
 
@@ -171,7 +178,142 @@ Boundaries nest by joining what the context already carries. The two cases:
 | A unit of work (inside a `RunWith` action) | Joins: runs the action now; the work it defers belongs to the outer unit. | Queues the task on that unit and returns `nil` at once. The task runs in the boundary's transaction, in `Defer` order, and its error is returned by the boundary. |
 | An open transaction and **no unit of work** (inside a task) | Runs the action in that transaction with a fresh unit whose tasks run right after it; the outer boundary commits. | Runs the task now. |
 
-A second transaction is never opened inside a first one, and a `RunWith` method may call an `in-tx` method or the other way round: both compose. `uow.InTransaction(ctx)` tells any code which situation it is in. A task that calls `Defer` on the unit that is executing it, or a goroutine that outlives the action and defers late, is reported with `uow.ErrLateDefer` instead of being silently dropped. Contexts handed to actions and tasks must not outlive their boundary.
+A second transaction is never opened inside a first one, and a `RunWith` method may call an `in-tx` method or the other way round: both compose, and the [flow comparison](#flow-comparison-a-service-calling-a-service) below draws each combination. `uow.InTransaction(ctx)` tells any code which situation it is in. A task that calls `Defer` on the unit that is executing it, or a goroutine that outlives the action and defers late, is reported with `uow.ErrLateDefer` instead of being silently dropped. Contexts handed to actions and tasks must not outlive their boundary.
+
+### Flow comparison: a service calling a service
+
+Every method of a `uow_service` interface is either a boundary (`RunWith`, the default) or a task (`//middlegen:in-tx`). When a method of service `A` calls a method of service `B`, those two kinds decide the shape of the call. The diagrams show the four combinations: `A` and `B` are generated `uow_service` middlewares, `repo` is a `uow_repo` middleware, and `manager` is the shared `uow.Manager`.
+
+**1. `A` is a boundary and calls no other service.** The action runs first, on the pool, and one transaction then runs what it queued. A retryable error re-runs the part between `BEGIN` and `COMMIT`; the action does not run again.
+
+```mermaid
+sequenceDiagram
+    participant C as caller
+    participant A as A.Method (RunWith)
+    participant M as manager
+    participant R as repo
+    participant DB
+    C->>A: Method(ctx)
+    A->>M: RunWith(action)
+    M->>A: action(ctx + unit)
+    A->>R: Get (non-transactional)
+    R->>DB: SELECT on the pool
+    A->>R: Save
+    R-->>A: queued, returns the item
+    A-->>M: nil
+    rect rgba(127, 127, 127, 0.12)
+    M->>DB: BEGIN
+    M->>R: Save (queued task)
+    R->>DB: INSERT
+    M->>DB: COMMIT
+    end
+    M-->>C: nil, or the task's error
+```
+
+**2. `A` is a boundary and calls `B`, which is `in-tx`.** The call queues `B`'s body on `A`'s unit of work and returns `nil` at once. The body keeps its place in the queue and runs with the transaction open, between the writes `A` queued before and after the call. `A`'s action cannot see `B`'s outcome: a read made after the call goes to the pool and sees the old state, and `B`'s error is what `A`'s `RunWith` returns. If `A`'s action returns an error, nothing runs, `B`'s body included.
+
+```mermaid
+sequenceDiagram
+    participant C as caller
+    participant A as A.Method (RunWith)
+    participant B as B.Method (in-tx)
+    participant M as manager
+    participant R as repo
+    participant DB
+    C->>A: Method(ctx)
+    A->>M: RunWith(action)
+    M->>A: action(ctx + unit)
+    A->>B: Method(ctx)
+    B->>M: RunInTx(task)
+    M-->>B: queued on A's unit
+    B-->>A: nil, the body has not run
+    A->>R: Save
+    R-->>A: queued
+    A-->>M: nil
+    rect rgba(127, 127, 127, 0.12)
+    M->>DB: BEGIN
+    M->>B: task(txCtx), B's body runs now
+    B->>R: Get, Save
+    R->>DB: SELECT, UPDATE at once
+    M->>R: Save (A's queued task)
+    R->>DB: INSERT
+    M->>DB: COMMIT
+    end
+    M-->>C: nil, or B's error, or the task's
+```
+
+**3. `A` is `in-tx` and calls `B`, which is a boundary.** The transaction is open before `A`'s body. `B`'s action runs at once inside it with a fresh unit of work; the writes `B` queues run as soon as its action returns, still inside `A`'s transaction, and the call returns `B`'s real result to `A`. Everything `B` does now happens inside a transaction, including whatever its action was written to do outside one, and a retry re-runs `A`'s whole body, `B` included.
+
+```mermaid
+sequenceDiagram
+    participant C as caller
+    participant A as A.Method (in-tx)
+    participant B as B.Method (RunWith)
+    participant M as manager
+    participant R as repo
+    participant DB
+    C->>A: Method(ctx)
+    A->>M: RunInTx(task)
+    rect rgba(127, 127, 127, 0.12)
+    M->>DB: BEGIN
+    M->>A: task(txCtx)
+    A->>R: Get, Save
+    R->>DB: SELECT, UPDATE at once
+    A->>B: Method(txCtx)
+    B->>M: RunWith(action)
+    M->>B: action(txCtx + fresh unit)
+    B->>R: Save
+    R-->>B: queued on B's unit
+    B-->>M: nil
+    M->>R: Save (B's queued task)
+    R->>DB: INSERT
+    M-->>B: nil, or the task's error
+    B-->>A: B's result, now
+    A-->>M: nil
+    M->>DB: COMMIT
+    end
+    M-->>C: nil, or the error
+```
+
+**4. Both are `in-tx`.** `A` opens the transaction and `B`'s body runs immediately inside it, returning its real result. One transaction, one commit, and one retry that re-runs both.
+
+```mermaid
+sequenceDiagram
+    participant C as caller
+    participant A as A.Method (in-tx)
+    participant B as B.Method (in-tx)
+    participant M as manager
+    participant R as repo
+    participant DB
+    C->>A: Method(ctx)
+    A->>M: RunInTx(task)
+    rect rgba(127, 127, 127, 0.12)
+    M->>DB: BEGIN
+    M->>A: task(txCtx)
+    A->>B: Method(txCtx)
+    B->>M: RunInTx(task)
+    M->>B: task(txCtx), runs now
+    B->>R: Get, Save
+    R->>DB: SELECT, UPDATE at once
+    B-->>A: B's result, now
+    A-->>M: nil
+    M->>DB: COMMIT
+    end
+    M-->>C: nil, or the error
+```
+
+Side by side:
+
+| | 1. boundary alone | 2. boundary calls `in-tx` | 3. `in-tx` calls boundary | 4. `in-tx` calls `in-tx` |
+|---|---|---|---|---|
+| The transaction opens | after `A`'s action | after `A`'s action | before `A`'s body | before `A`'s body |
+| `B`'s body runs | n/a | in `A`'s transaction, at its place in `A`'s queue | at once inside `A`'s transaction, then `B`'s queued writes | at once inside `A`'s transaction |
+| The call returns to `A` | n/a | `nil`, before the body runs | `B`'s real result | `B`'s real result |
+| `A` can branch on `B`'s outcome | n/a | no, `B`'s error is `A`'s return value | yes | yes |
+| A retryable error re-runs | `A`'s queued tasks | `A`'s queued tasks, `B`'s body included | `A`'s whole body, `B` included | `A`'s whole body, `B` included |
+| Where external calls are safe | `A`'s action | `A`'s action | nowhere, the transaction is open throughout | nowhere, the transaction is open throughout |
+
+Two rules produce all four shapes: a call made with a unit of work in the context is queued on it, and a call made with a transaction and no unit runs now, inside it. Shape 2 is the one to watch. The `in-tx` method behaves like a queued write there, so give it only work whose result the caller does not need until the commit. When `A` must act on `B`'s outcome, make `A` `in-tx` as well (shape 4) or move the decision into a conditional write (see [Read-modify-write](#read-modify-write-put-the-check-in-the-write)).
 
 ### Multiple databases
 
@@ -446,7 +588,7 @@ Directives are comments on the methods of the interface, written `//<prefix>:<di
 | Directive | Applies to | Effect |
 |---|---|---|
 | `//middlegen:non-transactional` | `uow_repo` | Run the method immediately even inside a unit of work. Use it for reads. |
-| `//middlegen:in-tx` | `uow_service` | Run the method as one task through `Manager.RunInTx`: the transaction is open before the body, decorated writes execute at once, and the whole body is re-run on a retryable error. Called inside a `RunWith` boundary the method is queued on it. The method must return only an `error`. |
+| `//middlegen:in-tx` | `uow_service` | Run the method as one task through `Manager.RunInTx`: the transaction is open before the body, decorated writes execute at once, and the whole body is re-run on a retryable error. Called inside a `RunWith` boundary the method is queued on it. The method must take a `context.Context` and return only an `error`. |
 | `//middlegen:echo <param>[, <param>...]` | `uow_repo` | Return the named parameters, in order, as the deferred method's non-error results. `echo none` disables echoing. |
 | `//middlegen:redact <param>[, <param>...]` | `logging` | Log the named parameters as `[REDACTED]`. |
 | `//middlegen:metric attr:<name>=<expr>` | `metrics` | Add a metric attribute computed from a Go expression over the parameters. |
@@ -625,7 +767,7 @@ Every kind produces one file, `<iface><suffix>`, where `<iface>` is the interfac
 | `tracing` | `<Iface>TracingMiddleware()` | `_tracing_middleware.gen.go` | Span `<service>.<Method>` of kind internal from `otel.Tracer(<service>)`; on error `RecordError` and status `Error`. Methods without a context are forwarded unchanged. |
 | `metrics` | `<Iface>MetricsMiddleware()` | `_metrics_middleware.gen.go` | On meter `<service>`: `<iface>_requests_total`, `<iface>_errors_total` and `<iface>_request_duration_seconds` (seconds, `DefaultLatencyBuckets`) with attribute `method` plus the `metric attr` attributes; one `Int64Counter` per `metric counter` name, without attributes. Methods without a context are measured with a background context. |
 | `uow_repo` | `<Iface>UoWMiddleware()` | `_uow_middleware.gen.go` | Methods with a context and without `non-transactional` are queued on the unit of work in the context and return immediately (see [What deferred methods return](#what-deferred-methods-return)); everything else passes through. |
-| `uow_service` | `<Iface>UoWMiddleware(manager *uow.Manager)` | `_uow_middleware.gen.go` | Every method with a context runs inside `manager.RunWith`, so the writes it makes through decorated repositories commit when it returns; a method marked `//middlegen:in-tx` runs as one task through `manager.RunInTx`. A nested call joins the outer boundary (see [Nesting](#nesting)). |
+| `uow_service` | `<Iface>UoWMiddleware(manager *uow.Manager)` | `_uow_middleware.gen.go` | Every method with a context runs inside `manager.RunWith`, so the writes it makes through decorated repositories commit when it returns; a method marked `//middlegen:in-tx` runs as one task through `manager.RunInTx`. A nested call joins the outer boundary (see [Nesting](#nesting) and the [flow comparison](#flow-comparison-a-service-calling-a-service)). |
 
 `uow_repo` and `uow_service` write the same file and constructor name, so generate one or the other for a given interface: repositories get `uow_repo`, the services calling them get `uow_service`.
 
