@@ -56,8 +56,9 @@ type Config struct {
 	// Endpoint is the address of the OTLP gRPC collector, either host:port
 	// ("grafana-alloy.monitoring:4317") or a URL ("https://collector:4317",
 	// "http://localhost:4317"). A URL's scheme decides transport security:
-	// http means plaintext and https means TLS; a missing port defaults to
-	// 4317.
+	// http means plaintext and https means TLS. In both forms a missing port
+	// defaults to 4317, the OTLP gRPC port, rather than to the gRPC default
+	// of 443.
 	//
 	// When set, InitTelemetry opens one gRPC connection that all three
 	// exporters share. When empty, each exporter dials on its own, following
@@ -150,7 +151,7 @@ func (c Config) exporterTarget() (target string, plaintext bool, err error) {
 		return "", c.Insecure, nil
 	}
 	if !strings.Contains(ep, "://") {
-		return ep, c.Insecure, nil
+		return withDefaultPort(ep), c.Insecure, nil
 	}
 
 	u, err := url.Parse(ep)
@@ -168,11 +169,17 @@ func (c Config) exporterTarget() (target string, plaintext bool, err error) {
 	if u.Host == "" {
 		return "", false, fmt.Errorf("telemetry: Endpoint %q has no host", ep)
 	}
-	target = u.Host
-	if _, _, err := net.SplitHostPort(target); err != nil {
-		target = net.JoinHostPort(u.Hostname(), defaultOTLPPort)
+	return withDefaultPort(u.Host), plaintext, nil
+}
+
+// withDefaultPort returns hostport unchanged when it names a port, and with
+// the OTLP default port appended otherwise. Without it a bare host would be
+// dialled on gRPC's default port, 443.
+func withDefaultPort(hostport string) string {
+	if _, _, err := net.SplitHostPort(hostport); err == nil {
+		return hostport
 	}
-	return target, plaintext, nil
+	return net.JoinHostPort(strings.Trim(hostport, "[]"), defaultOTLPPort)
 }
 
 // validate reports configuration that cannot work.
