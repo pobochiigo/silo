@@ -32,6 +32,10 @@ func TestConfigExporterTarget(t *testing.T) {
 		{name: "https URL is TLS even with Insecure", cfg: Config{Endpoint: "https://collector.example.com:443", Insecure: true}, target: "collector.example.com:443"},
 		{name: "URL without port gets the OTLP default", cfg: Config{Endpoint: "https://collector.example.com"}, target: "collector.example.com:4317"},
 		{name: "IPv6 URL without port", cfg: Config{Endpoint: "http://[::1]"}, target: "[::1]:4317", plaintext: true},
+		{name: "bare host without port gets the OTLP default, not gRPC's 443", cfg: Config{Endpoint: "alloy"}, target: "alloy:4317"},
+		{name: "bare IPv6 without port", cfg: Config{Endpoint: "[::1]", Insecure: true}, target: "[::1]:4317", plaintext: true},
+		{name: "unbracketed IPv6 without port", cfg: Config{Endpoint: "::1"}, target: "[::1]:4317"},
+		{name: "IPv6 with port passes through", cfg: Config{Endpoint: "[::1]:4318"}, target: "[::1]:4318"},
 		{name: "unsupported scheme", cfg: Config{Endpoint: "grpc://collector:4317"}, wantErr: "unsupported scheme"},
 		{name: "URL without host", cfg: Config{Endpoint: "https://"}, wantErr: "has no host"},
 	}
