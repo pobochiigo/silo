@@ -352,6 +352,10 @@ type Svc interface {
 
 	err = run(dir, options{TypeName: "Svc", Kinds: []string{"uow_service"}})
 	assert.ErrorContains(t, err, "in-tx needs a context parameter and error as the only result")
+
+	// The in-tx constraint belongs to uow_service; other kinds ignore the directive.
+	err = run(dir, options{TypeName: "Svc", Kinds: []string{"logging", "tracing"}, OutDir: t.TempDir()})
+	assert.NoError(t, err)
 }
 
 // TestGolden renders every template for the interface in

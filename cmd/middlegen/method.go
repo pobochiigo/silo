@@ -147,12 +147,6 @@ func (g *generator) buildMethod(fn *types.Func, ifaceName string) (Method, error
 		m.Results[n-1].Name = "err"
 		m.HasError = true
 	}
-	if m.InTx && !(m.HasContext && len(m.Results) == 1 && m.HasError) {
-		// Called inside another boundary the method is queued and returns
-		// before its body runs, so it cannot promise results.
-		return Method{}, fmt.Errorf("%s.%s: //%s:in-tx needs a context parameter and error as the only result", ifaceName, fn.Name(), g.opts.Prefix)
-	}
-
 	// Metric attribute expressions were written against the original
 	// parameter names; rewrite any that were renamed.
 	for i := range m.CustomAttributes {
@@ -223,6 +217,13 @@ func (m *Method) finalize() {
 	default:
 		m.RepoDeferStmt = fmt.Sprintf("m.next.%s(%s)\n\t\t\treturn nil", m.Name, m.ParamsNamesWithTx)
 	}
+}
+
+// inTxCompatible reports whether the method can run as one task through
+// Manager.RunInTx: called inside another boundary it is queued and returns
+// before its body runs, so it can promise nothing but an error.
+func (m Method) inTxCompatible() bool {
+	return m.HasContext && len(m.Results) == 1 && m.HasError
 }
 
 // param looks a parameter up by its original (label) or generated name.

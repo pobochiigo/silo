@@ -209,6 +209,11 @@ func run(cwd string, o options) error {
 		if err != nil {
 			return err
 		}
+		// Directives of kinds that are not generated are ignored, so the
+		// uow_service constraints apply only when that kind is requested.
+		if wantsUoWService && method.InTx && !method.inTxCompatible() {
+			return fmt.Errorf("%s.%s: //%s:in-tx needs a context parameter and error as the only result", name, method.Name, o.Prefix)
+		}
 		if wantsUoWService && method.HasContext && !method.HasError {
 			log.Printf("Warning: %s.%s returns no error; Unit of Work failures in the generated uow_service middleware are logged via slog, not returned",
 				name, method.Name)
