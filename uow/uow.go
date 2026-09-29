@@ -187,7 +187,9 @@ type Manager struct {
 	isRetryable EvaluatorFn
 }
 
-// NewManager creates a new Manager with the provided options.
+// NewManager creates a new Manager with the provided options. Without
+// options no error is retried, which [WithRetryEvaluator] changes; the retry
+// budget defaults to 3 retries, backing off from 50ms up to 500ms.
 func NewManager(database Transactor, opts ...Option) *Manager {
 	m := &Manager{
 		db:          database,

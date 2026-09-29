@@ -31,7 +31,7 @@ go install github.com/pobochiigo/silo/cmd/middlegen@$(go list -m -f '{{.Version}
 ```
 or let `go generate` fetch a pinned version on demand:
 ```go
-//go:generate go run github.com/pobochiigo/silo/cmd/middlegen@v0.1.0 -type=UserRepository -kinds=uow_repo,logging,tracing
+//go:generate go run github.com/pobochiigo/silo/cmd/middlegen@v0.3.0 -type=UserRepository -kinds=uow_repo,logging,tracing
 ```
 
 ---
@@ -45,7 +45,7 @@ The [`examples`](examples/) directory is a separate Go module with runnable prog
 | [`examples/middlegen`](examples/middlegen/) | Every directive on one interface, all four kinds of generated middleware, when deferred writes really execute, generation into another package. Runs without any infrastructure. |
 | [`examples/uow`](examples/uow/) | A ledger service on database/sql, sqlx and pgx with the same generated middlewares; `RunWith` boundaries with the check in the write, a `//middlegen:in-tx` task, SERIALIZABLE retries under concurrency and the nesting rules, against PostgreSQL. |
 | [`examples/telemetry`](examples/telemetry/) | `InitTelemetry`, the go-kit endpoint middlewares, trace propagation over HTTP and gRPC metadata, the go-kit log adapter and the fan-out handler. |
-| [`examples/connectrpc`](examples/connectrpc/) | A Connect RPC served from a type-safe endpoint and called through a type-safe client endpoint. |
+| [`examples/connectrpc`](examples/connectrpc/) | A Connect RPC served from a type-safe endpoint and called through a type-safe client endpoint; a go-kit middleware on a typed endpoint through `telemetry.Adapt`. |
 
 ```bash
 cd examples
@@ -86,7 +86,7 @@ silo/
 ```mermaid
 graph TD
     Service[Service Layer] -->|Uses| UoW[uow.Manager]
-    UoW -->|Wraps in Transaction| DB[db.SQLTransactor / db.PGXTransactor]
+    UoW -->|Wraps in Transaction| DB[db.SQLTransactor / db.SQLXTransactor / db.PGXTransactor]
     Service -->|Decorated by| Middleware[Generated Middlewares]
     Middleware -->|Publishes| Telemetry[telemetry.Metrics / Tracing]
 ```
@@ -210,7 +210,7 @@ sequenceDiagram
     M-->>C: nil, or the task's error
 ```
 
-**2. `A` is a boundary and calls `B`, which is `in-tx`.** The call queues `B`'s body on `A`'s unit of work and returns `nil` at once. The body keeps its place in the queue and runs with the transaction open, between the writes `A` queued before and after the call. `A`'s action cannot see `B`'s outcome: a read made after the call goes to the pool and sees the old state, and `B`'s error is what `A`'s `RunWith` returns. If `A`'s action returns an error, nothing runs, `B`'s body included.
+**2. `A` is a boundary and calls `B`, which is `in-tx`.** The call queues `B`'s body on `A`'s unit of work and returns `nil` at once. The body keeps its place in the queue and runs with the transaction open, between the writes `A` queued before and after the call. `A`'s action cannot see `B`'s outcome: a read made after the call goes to the pool and sees the old state, and `B`'s error is what `A`'s `RunWith` returns. If `A`'s action returns an error, nothing runs, `B`'s body included. The logging and tracing middlewares around `B` see only the queuing call: `B`'s span ends before its body runs, the body's repository calls are traced under `A`'s span, and a failure is logged as `A`'s.
 
 ```mermaid
 sequenceDiagram
@@ -330,7 +330,7 @@ manager := uow.NewManager(transactor,
 )
 ```
 
-`db.IsRetryableTxError` recognises PostgreSQL `serialization_failure` (40001) and `deadlock_detected` (40P01) through any driver whose errors expose `SQLState()`, which includes pgx and lib/pq. Retries back off exponentially from the base delay up to the cap, minus up to 25% random jitter so colliding workers do not retry in lock-step.
+`db.IsRetryableTxError` recognises PostgreSQL `serialization_failure` (40001) and `deadlock_detected` (40P01) through any driver whose errors expose `SQLState()`, which includes pgx and lib/pq. Retries back off exponentially from the base delay up to the cap, minus up to 25% random jitter so colliding workers do not retry in lock-step. Without `WithRetryEvaluator` nothing is retried; the budget defaults to 3 retries, backing off from 50ms up to 500ms.
 
 ---
 
@@ -443,7 +443,7 @@ Run Go generate from your shell:
 ```bash
 go generate ./...
 ```
-The `//go:generate go tool middlegen` lines use the generator recorded in `go.mod` (see [Installation](#installation)); with an installed binary write `//go:generate middlegen ...` instead, and with neither use the `go run ...@v0.1.0` form. Regenerating is always safe: previously generated `.gen.go` files are ignored while the package is loaded, so stale output that no longer compiles does not block the generator.
+The `//go:generate go tool middlegen` lines use the generator recorded in `go.mod` (see [Installation](#installation)); with an installed binary write `//go:generate middlegen ...` instead, and with neither use the `go run ...@v0.3.0` form. Regenerating is always safe: previously generated `.gen.go` files are ignored while the package is loaded, so stale output that no longer compiles does not block the generator.
 
 This automatically produces the following decorators inside your package directories:
 - `user_repository_logging_middleware.gen.go`
@@ -588,7 +588,7 @@ Directives are comments on the methods of the interface, written `//<prefix>:<di
 | Directive | Applies to | Effect |
 |---|---|---|
 | `//middlegen:non-transactional` | `uow_repo` | Run the method immediately even inside a unit of work. Use it for reads. |
-| `//middlegen:in-tx` | `uow_service` | Run the method as one task through `Manager.RunInTx`: the transaction is open before the body, decorated writes execute at once, and the whole body is re-run on a retryable error. Called inside a `RunWith` boundary the method is queued on it. The method must take a `context.Context` and return only an `error`. |
+| `//middlegen:in-tx` | `uow_service` | Run the method as one task through `Manager.RunInTx`: the transaction is open before the body, decorated writes execute at once, and the whole body is re-run on a retryable error. Called inside a `RunWith` boundary the method is queued on it. The method must take a `context.Context` and return only an `error`; this is checked when `uow_service` is generated. |
 | `//middlegen:echo <param>[, <param>...]` | `uow_repo` | Return the named parameters, in order, as the deferred method's non-error results. `echo none` disables echoing. |
 | `//middlegen:redact <param>[, <param>...]` | `logging` | Log the named parameters as `[REDACTED]`. |
 | `//middlegen:metric attr:<name>=<expr>` | `metrics` | Add a metric attribute computed from a Go expression over the parameters. |
@@ -829,6 +829,13 @@ import "context"
 type Endpoint[Req any, Resp any] func(ctx context.Context, request Req) (Resp, error)
 ```
 
+The package depends on the standard library only, so an SDK built on it (a set of `Service` interfaces implemented by Connect clients and servers alike) pulls nothing else into its consumers' module graphs. `telemetry.Adapt` turns a go-kit endpoint middleware into a `middleware.Middleware` for a typed endpoint, so the [go-kit endpoint middlewares](#go-kit-endpoint-middlewares), or any other go-kit middleware, decorate it without giving up the types. The type parameters name the endpoint's request and response:
+```go
+greet = telemetry.Adapt[GreetRequest, GreetResponse](telemetry.TracingMiddleware("greet"))(greet)
+greet = telemetry.Adapt[GreetRequest, GreetResponse](telemetry.MetricsMiddleware("greet"))(greet)
+```
+A go-kit middleware that replaces the request or the response with a value of another type makes the adapted endpoint return an error rather than panic.
+
 ### ConnectRPC Adapters
 The `connectrpc` package adapts these type-safe endpoints to ConnectRPC server handlers and client endpoints. The endpoint sees only the decoded message: request headers, response headers and trailers are not exposed. Handle them in a Connect interceptor, or read them in the decoder, which receives the raw `*connect.Request`'s message and context.
 
@@ -882,7 +889,7 @@ In addition to bootstrapping OpenTelemetry traces, metrics, and logs, the `telem
 | Field | Description |
 |---|---|
 | `ServiceName`, `ServiceVersion`, `Environment` | Resource attributes attached to all traces, metrics, and logs. The environment is emitted as both `deployment.environment.name` (current semantic conventions) and `deployment.environment`. Empty values are left out so `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` can fill them; non-empty values win over the environment. |
-| `Endpoint` | The OTLP gRPC collector (Grafana Alloy, OTel Collector, ...) as `host:port` or a URL. A URL's scheme decides transport security (`http://` plaintext, `https://` TLS) and a missing port defaults to 4317. When set, the three exporters share **one** gRPC connection. When empty, each exporter dials on its own following `OTEL_EXPORTER_OTLP_ENDPOINT` and then the OTLP default `localhost:4317`. |
+| `Endpoint` | The OTLP gRPC collector (Grafana Alloy, OTel Collector, ...) as `host:port` or a URL. A URL's scheme decides transport security (`http://` plaintext, `https://` TLS). In both forms a missing port defaults to 4317, not to gRPC's 443. When set, the three exporters share **one** gRPC connection. When empty, each exporter dials on its own following `OTEL_EXPORTER_OTLP_ENDPOINT` and then the OTLP default `localhost:4317`. |
 | `Insecure` | Disables TLS on exporter connections (plaintext gRPC). Defaults to `false` — TLS with the system certificate pool. Ignored when `Endpoint` is a URL. |
 | `TLSConfig` | TLS settings for the exporter connections: a private CA in `RootCAs`, client certificates for mutual TLS. Nil uses the system pool. |
 | `Compression` | `"gzip"` to compress exports; empty for none. |
@@ -919,7 +926,7 @@ slog.SetDefault(slog.New(handler))
 Errors are logged under the `error` attribute everywhere in Silo: the go-kit middlewares, the go-kit adapter and the generated middlewares.
 
 ### Go-Kit Endpoint Middlewares
-Standard endpoint middlewares designed to wrap Go-Kit (`github.com/go-kit/kit/endpoint`) endpoints:
+Standard endpoint middlewares designed to wrap Go-Kit (`github.com/go-kit/kit/endpoint`) endpoints, and typed endpoints through [`telemetry.Adapt`](#type-safe-endpoint):
 - `MetricsMiddleware(operationName)`: Automatically records execution counts and latency durations via OTel metrics, labelled with `operation` and a boolean `success`.
 - `LoggingMiddleware(operationName, logger)`: Logs execution status, elapsed time, and errors via `slog` (TraceID-correlated).
 - `TracingMiddleware(operationName)`: Automatically creates child tracing spans around endpoint execution.
