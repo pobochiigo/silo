@@ -58,7 +58,8 @@ func decodeGreetResponse(_ context.Context, msg *greeterv1.GreetResponse) (Greet
 }
 
 // timing is a hand-written middleware for typed endpoints, built on the same
-// generic Middleware type the generated decorators use.
+// generic Middleware type the generated decorators use; telemetry.Adapt
+// produces the same type from a go-kit middleware.
 func timing[Req, Resp any](label string) middleware.Middleware[endpoint.Endpoint[Req, Resp]] {
 	return func(next endpoint.Endpoint[Req, Resp]) endpoint.Endpoint[Req, Resp] {
 		return func(ctx context.Context, req Req) (Resp, error) {

@@ -1,3 +1,6 @@
+// Package endpoint defines a type-safe endpoint signature. It depends on the
+// standard library only, so SDKs built on it stay lean; go-kit endpoint
+// middlewares are applied to it through telemetry.Adapt.
 package endpoint
 
 import "context"

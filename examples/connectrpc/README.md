@@ -26,9 +26,11 @@ go run ./connectrpc
    name; `greet` answers `CodeNotFound` for "nobody".
 2. **Client.** `connectrpc.NewConnectClient(client.Greet, encodeGreetRequest,
    decodeGreetResponse)` turns the generated Connect client method into an
-   `endpoint.Endpoint[GreetRequest, GreetResponse]`. The `timing` middleware
-   in `greeter.go` shows that `middleware.Middleware[T]` works for endpoint
-   types as well as for the generated interface decorators.
+   `endpoint.Endpoint[GreetRequest, GreetResponse]`. It is decorated twice:
+   `telemetry.Adapt` applies `telemetry.LoggingMiddleware`, a go-kit endpoint
+   middleware, to the typed endpoint, and the hand-written `timing`
+   middleware in `greeter.go` shows that `middleware.Middleware[T]` works for
+   endpoint types as well as for the generated interface decorators.
 3. **Decode failure.** The client receives `CodeInvalidArgument` with the
    decoder's message: decode errors on the server are mapped to that code
    unless they already carry a Connect code.
