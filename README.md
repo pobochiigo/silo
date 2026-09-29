@@ -45,7 +45,7 @@ The [`examples`](examples/) directory is a separate Go module with runnable prog
 | [`examples/middlegen`](examples/middlegen/) | Every directive on one interface, all four kinds of generated middleware, when deferred writes really execute, generation into another package. Runs without any infrastructure. |
 | [`examples/uow`](examples/uow/) | A ledger service on database/sql, sqlx and pgx with the same generated middlewares; `RunWith` boundaries with the check in the write, a `//middlegen:in-tx` task, SERIALIZABLE retries under concurrency and the nesting rules, against PostgreSQL. |
 | [`examples/telemetry`](examples/telemetry/) | `InitTelemetry`, the go-kit endpoint middlewares, trace propagation over HTTP and gRPC metadata, the go-kit log adapter and the fan-out handler. |
-| [`examples/connectrpc`](examples/connectrpc/) | A Connect RPC served from a type-safe endpoint and called through a type-safe client endpoint; a go-kit middleware on a typed endpoint through `telemetry.Adapt`. |
+| [`examples/connectrpc`](examples/connectrpc/) | An SDK layout on the typed endpoints: a `Service` interface implemented by the server and by the Connect client alike, endpoints, a Connect handler that can be backed by another server (a gateway), the generated decorators on both sides and a go-kit middleware on every endpoint through `telemetry.Adapt`. |
 
 ```bash
 cd examples
@@ -838,6 +838,8 @@ A go-kit middleware that replaces the request or the response with a value of an
 
 ### ConnectRPC Adapters
 The `connectrpc` package adapts these type-safe endpoints to ConnectRPC server handlers and client endpoints. The endpoint sees only the decoded message: request headers, response headers and trailers are not exposed. Handle them in a Connect interceptor, or read them in the decoder, which receives the raw `*connect.Request`'s message and context.
+
+The [connectrpc example](examples/connectrpc/) shows the layout these adapters are meant for: a feature package with the domain types, a `Service` interface, its `Endpoints` and a `NewXHandler(svc)` constructor, and a client package whose `NewXClient(httpClient, baseURL, opts...)` returns the same `Service`. Because the client is a `Service`, a handler can be backed by a client of another server, and decorators written for the service, the generated ones included, fit both sides.
 
 #### Server Handler Construction (`NewConnectServer`)
 Converts a generic `endpoint.Endpoint` into a ConnectRPC server handler, using custom decoders and encoders. Decode failures are reported as `CodeInvalidArgument` and encode failures as `CodeInternal` unless the error already carries a Connect code; endpoint errors pass through untouched.
