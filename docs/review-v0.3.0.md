@@ -61,8 +61,20 @@ sees the request and response as `any`; one that replaces either with a
 value of another type makes the adapted endpoint return an error rather than
 panic on the type assertion, and nil interface values pass through. The type
 parameters must be spelled out, since Go cannot infer them from an untyped
-middleware. The connectrpc example's `MakeEndpoints` applies go-kit
-middlewares to every endpoint this way.
+middleware.
+
+Follow-up in the same change: the tracing, logging and metrics middlewares
+are typed first, `Tracing`, `Logging` and `Metrics` over
+`endpoint.Endpoint[Req, Resp]`, since none of them looks at the request or
+the response. go-kit's endpoint is `Endpoint[any, any]` under another name,
+so `telemetry.Kit` converts the `[any, any]` instantiation into a go-kit
+middleware by type conversion, and `Adapt` stays for foreign go-kit
+middlewares. `Metrics` records on a `MetricsRecorder`, so the series carry
+the caller's subsystem (`auth_endpoint_requests_total`) instead of `gokit_`;
+the deprecated `MetricsMiddleware` records under the subsystem `endpoint`.
+`middleware.Chain` composes middlewares of one type. The connectrpc example
+decorates its `Endpoints` fields with `telemetry.Metrics` and both `Service`
+sides with `middleware.Chain`.
 
 The adapter lives in `telemetry`, not in `endpoint`, on purpose. A first cut
 put it in `endpoint`, which made that package import go-kit; the `bhole`

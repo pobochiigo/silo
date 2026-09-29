@@ -22,25 +22,27 @@ go run ./connectrpc -v       # Debug logging shows every "Greet started" line
 | `greeter/greeter.go` | The domain types: `GreetRequest`, `GreetResponse`, `ErrUnknownPerson`. No protobuf, no Connect. |
 | `greeter/service.go` | The `Service` interface, the `go:generate` line for its decorators, and the in-process implementation. |
 | `greeter/*.gen.go` | Generated: `logging` and `tracing` for `Service`. They wrap the implementation on the server and the client on the caller's side. |
-| `greeter/endpoint.go` | `Endpoints`, one `endpoint.Endpoint[*GreetRequest, *GreetResponse]` per method, and `MakeEndpoints(svc, mws...)`, which wraps every endpoint with the given go-kit middlewares through `telemetry.Adapt`. |
-| `greeter/connectrpc_server.go` | `NewGreeterHandler(svc, mws...)`: the generated handler interface implemented by delegating to `connectrpc.NewConnectServer` handlers, with the decoder and encoder of each method. |
+| `greeter/endpoint.go` | `Endpoints`, one exported `endpoint.Endpoint[*GreetRequest, *GreetResponse]` per method, and `MakeEndpoints(svc)`. Callers decorate the fields before handing them to the transport. |
+| `greeter/connectrpc_server.go` | `NewGreeterHandler(eps)`: the transport layer, the generated handler interface implemented by delegating to `connectrpc.NewConnectServer` handlers, with the decoder and encoder of each method. |
 | `client/greeter/endpoint.go` | An unexported `endpoints` struct that implements `greeter.Service` by calling one endpoint per method. |
 | `client/greeter/connectrpc_transport.go` | `NewGreeterClient(httpClient, baseURL, opts...) greeter.Service`: the generated Connect client turned into typed endpoints by `connectrpc.NewConnectClient`, with the encoder and decoder of each method. |
 | `main.go` | Wires the server, the client and a gateway, and walks through the steps below. |
 
-The two packages depend on `silo/endpoint` and `silo/connectrpc`, which pull
-nothing beyond `connectrpc.com/connect` into a consumer's module graph;
-`greeter/endpoint.go` adds go-kit only for the optional middleware parameter.
+The two packages depend on `silo/endpoint` and `silo/connectrpc` only, which
+pull nothing beyond `connectrpc.com/connect` into a consumer's module graph.
+Observability is wired by the caller, in `main.go`.
 
 ## What the run shows
 
-1. **Server.** `greeter.NewService()` is wrapped by the generated tracing and
-   logging middlewares, then `greeter.NewGreeterHandler(svc,
-   telemetry.MetricsMiddleware("greeter"))` turns it into the generated
-   handler interface: one endpoint per method, the metrics middleware on
-   every endpoint through `telemetry.Adapt`, `connectrpc.NewConnectServer`
-   around each with its decoder and encoder. `decodeGreetRequest` rejects an
-   empty name; the service answers `CodeNotFound` for "nobody".
+1. **Server.** Three layers. `middleware.Chain` wraps `greeter.NewService()`
+   in the generated logging and tracing decorators. `greeter.MakeEndpoints`
+   turns the `Service` into typed endpoints, and `telemetry.Metrics`
+   decorates the `Greet` field, recording on a `MetricsRecorder` whose
+   subsystem, `greeter_endpoint`, names the series.
+   `greeter.NewGreeterHandler(eps)` turns the endpoints into the generated
+   handler interface through `connectrpc.NewConnectServer`, with the decoder
+   and encoder of each method. `decodeGreetRequest` rejects an empty name;
+   the service answers `CodeNotFound` for "nobody".
 2. **Client.** `greeterclient.NewGreeterClient(http.DefaultClient, url)`
    returns a `greeter.Service`, so the same generated decorators wrap it. A
    call therefore produces two `greeter.Greet` spans, the client's and the
@@ -55,12 +57,13 @@ nothing beyond `connectrpc.com/connect` into a consumer's module graph;
    pass through the adapter untouched, so the business code stays in charge
    of its codes. Both sides log the failure.
 5. **Gateway.** A client is a `Service`, so
-   `greeter.NewGreeterHandler(greeterclient.NewGreeterClient(...))` serves
-   the upstream server through a second one. The gateway needs no code of
-   its own, and `CodeNotFound` survives both hops.
-6. **Metrics.** `gokit_requests_total` and `gokit_request_duration_seconds`
-   from the endpoint middleware of the upstream server, labelled with
-   `operation` and `success`.
+   `greeter.NewGreeterHandler(greeter.MakeEndpoints(greeterclient.NewGreeterClient(...)))`
+   serves the upstream server through a second one. The gateway needs no
+   code of its own, and `CodeNotFound` survives both hops.
+6. **Metrics.** `greeter_endpoint_requests_total`,
+   `greeter_endpoint_errors_total` and
+   `greeter_endpoint_request_duration_seconds` from the endpoint middleware
+   of the upstream server, labelled with `method`.
 
 ```
 == 5. Gateway: a client is a Service, so a handler can be backed by another server; codes survive both hops
@@ -71,8 +74,9 @@ time=2026-09-29T05:39:33.610Z level=ERROR msg="Greet failed" service=greeter err
    code=not_found err=not_found: greeter: unknown person
 
 == 6. Metrics recorded by the endpoint middleware of the upstream server
-   gokit_requests_total{operation=greeter,success=true} = 2
-   gokit_requests_total{operation=greeter,success=false} = 2
+   greeter_endpoint_requests_total{method=Greet} = 4
+   greeter_endpoint_errors_total{method=Greet} = 2
+   greeter_endpoint_request_duration_seconds{method=Greet} count=4
 ```
 
 ## Things worth copying
@@ -80,9 +84,13 @@ time=2026-09-29T05:39:33.610Z level=ERROR msg="Greet failed" service=greeter err
 - The `Service` interface is the pivot. The server consumes it, the client
   produces it, and everything written against it (decorators, tests, a
   gateway) works on both sides.
-- Decorate at the `Service` level with the generated middlewares, and at the
-  endpoint level with go-kit middlewares through `MakeEndpoints`. The
-  first sees business types, the second sees every method alike.
+- Decorate at the `Service` level with the generated middlewares and at the
+  endpoint level with `telemetry.Tracing`, `telemetry.Logging` and
+  `telemetry.Metrics` on the exported `Endpoints` fields; `middleware.Chain`
+  composes either kind. A go-kit middleware fits an endpoint through
+  `telemetry.Adapt`. Generated SDK code can spell out the type arguments per
+  endpoint; a `NewXHandler(svc)` convenience that calls `MakeEndpoints`
+  itself, as bhole's generators emit, still fits on top.
 - Keep protobuf out of the domain: the codecs in `connectrpc_server.go` and
   `connectrpc_transport.go` are the only files that import `gen/`.
 - Headers and trailers are not visible to the endpoint; handle them in a

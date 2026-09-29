@@ -5,7 +5,7 @@ Silo is a core library containing a transactional Unit of Work engine, OpenTelem
 ## Features
 
 - **Unit of Work (UoW)**: A driver-agnostic transaction coordinator that queues tasks to execute in a single database transaction, with configurable retries and isolation levels. Out-of-the-box support for Go standard library `database/sql`, `sqlx` (including named queries), and native `pgx` (`pgxpool.Pool` and `pgx.Tx`).
-- **Telemetry**: OpenTelemetry bootstrappers for traces, metrics, and logs, alongside `go-kit` endpoint middlewares.
+- **Telemetry**: OpenTelemetry bootstrappers for traces, metrics, and logs, alongside typed endpoint middlewares that fit go-kit endpoints as well.
 - **Middlegen**: A command-line tool that parses Go interfaces and automatically generates production-ready middleware wrappers for logging, tracing, metrics, and UoW boundaries.
 
 ---
@@ -44,8 +44,8 @@ The [`examples`](examples/) directory is a separate Go module with runnable prog
 |---|---|
 | [`examples/middlegen`](examples/middlegen/) | Every directive on one interface, all four kinds of generated middleware, when deferred writes really execute, generation into another package. Runs without any infrastructure. |
 | [`examples/uow`](examples/uow/) | A ledger service on database/sql, sqlx and pgx with the same generated middlewares; `RunWith` boundaries with the check in the write, a `//middlegen:in-tx` task, SERIALIZABLE retries under concurrency and the nesting rules, against PostgreSQL. |
-| [`examples/telemetry`](examples/telemetry/) | `InitTelemetry`, the go-kit endpoint middlewares, trace propagation over HTTP and gRPC metadata, the go-kit log adapter and the fan-out handler. |
-| [`examples/connectrpc`](examples/connectrpc/) | An SDK layout on the typed endpoints: a `Service` interface implemented by the server and by the Connect client alike, endpoints, a Connect handler that can be backed by another server (a gateway), the generated decorators on both sides and a go-kit middleware on every endpoint through `telemetry.Adapt`. |
+| [`examples/telemetry`](examples/telemetry/) | `InitTelemetry`, the endpoint middlewares on a go-kit endpoint through `telemetry.Kit`, trace propagation over HTTP and gRPC metadata, the go-kit log adapter and the fan-out handler. |
+| [`examples/connectrpc`](examples/connectrpc/) | An SDK layout on the typed endpoints: a `Service` interface implemented by the server and by the Connect client alike, endpoints, a Connect handler that can be backed by another server (a gateway), the generated decorators on both sides through `middleware.Chain` and `telemetry.Metrics` on the endpoints. |
 
 ```bash
 cd examples
@@ -829,12 +829,14 @@ import "context"
 type Endpoint[Req any, Resp any] func(ctx context.Context, request Req) (Resp, error)
 ```
 
-The package depends on the standard library only, so an SDK built on it (a set of `Service` interfaces implemented by Connect clients and servers alike) pulls nothing else into its consumers' module graphs. `telemetry.Adapt` turns a go-kit endpoint middleware into a `middleware.Middleware` for a typed endpoint, so the [go-kit endpoint middlewares](#go-kit-endpoint-middlewares), or any other go-kit middleware, decorate it without giving up the types. The type parameters name the endpoint's request and response:
+The package depends on the standard library only, so an SDK built on it (a set of `Service` interfaces implemented by Connect clients and servers alike) pulls nothing else into its consumers' module graphs. The [endpoint middlewares](#endpoint-middlewares) of the `telemetry` package decorate a typed endpoint directly, and `middleware.Chain` composes middlewares of one type, the generated decorators included:
 ```go
-greet = telemetry.Adapt[GreetRequest, GreetResponse](telemetry.TracingMiddleware("greet"))(greet)
-greet = telemetry.Adapt[GreetRequest, GreetResponse](telemetry.MetricsMiddleware("greet"))(greet)
+eps.Greet = middleware.Chain(
+	telemetry.Tracing[*GreetRequest, *GreetResponse]("greeter.Greet"),
+	telemetry.Metrics[*GreetRequest, *GreetResponse](recorder, "Greet"),
+)(eps.Greet)
 ```
-A go-kit middleware that replaces the request or the response with a value of another type makes the adapted endpoint return an error rather than panic.
+The type arguments are spelled out because Go cannot infer them from a string; generated SDK code does not mind. A go-kit middleware, such as go-kit's rate limiter or circuit breaker, is applied to a typed endpoint through `telemetry.Adapt[Req, Resp](mw)`; one that replaces the request or the response with a value of another type makes the adapted endpoint return an error rather than panic.
 
 ### ConnectRPC Adapters
 The `connectrpc` package adapts these type-safe endpoints to ConnectRPC server handlers and client endpoints. The endpoint sees only the decoded message: request headers, response headers and trailers are not exposed. Handle them in a Connect interceptor, or read them in the decoder, which receives the raw `*connect.Request`'s message and context.
@@ -910,7 +912,7 @@ The resource also carries the `telemetry.sdk.*` attributes and `host.name`. Its 
 
 ### Metrics
 
-Latency histograms created by `NewMetricsRecorder` (used by the generated metrics middlewares) and by `MetricsMiddleware` use `telemetry.DefaultLatencyBuckets`, second-scale boundaries from 5ms to 10s matching the Prometheus client defaults. The OpenTelemetry SDK's own defaults are sized for milliseconds and would put every request faster than five seconds into one bucket, making percentiles meaningless. Counters carry the unit `{request}` and histograms `s`.
+Every subsystem names its own series: `<subsystem>_requests_total`, `<subsystem>_errors_total` and `<subsystem>_request_duration_seconds`, with the attribute `method`. The subsystem is the interface name for a generated metrics middleware and the recorder's for `telemetry.Metrics`, so `NewMetricsRecorder(meter, "auth_endpoint")` yields `auth_endpoint_requests_total`. Latency histograms created by `NewMetricsRecorder` use `telemetry.DefaultLatencyBuckets`, second-scale boundaries from 5ms to 10s matching the Prometheus client defaults. The OpenTelemetry SDK's own defaults are sized for milliseconds and would put every request faster than five seconds into one bucket, making percentiles meaningless. Counters carry the unit `{request}` and histograms `s`.
 
 `InitTraces` registers the W3C `TraceContext`/`Baggage` propagators globally. Applications that skip tracing but still forward trace headers can call `telemetry.InitPropagators()` directly.
 
@@ -925,13 +927,20 @@ handler := telemetry.NewFanoutHandler(myLocalHandler, otelslog.NewHandler("my-ap
 slog.SetDefault(slog.New(handler))
 ```
 
-Errors are logged under the `error` attribute everywhere in Silo: the go-kit middlewares, the go-kit adapter and the generated middlewares.
+Errors are logged under the `error` attribute everywhere in Silo: the endpoint middlewares, the go-kit log adapter and the generated middlewares.
 
-### Go-Kit Endpoint Middlewares
-Standard endpoint middlewares designed to wrap Go-Kit (`github.com/go-kit/kit/endpoint`) endpoints, and typed endpoints through [`telemetry.Adapt`](#type-safe-endpoint):
-- `MetricsMiddleware(operationName)`: Automatically records execution counts and latency durations via OTel metrics, labelled with `operation` and a boolean `success`.
-- `LoggingMiddleware(operationName, logger)`: Logs execution status, elapsed time, and errors via `slog` (TraceID-correlated).
-- `TracingMiddleware(operationName)`: Automatically creates child tracing spans around endpoint execution.
+### Endpoint middlewares
+Typed middlewares for `endpoint.Endpoint[Req, Resp]`, each a `middleware.Middleware` so they compose with `middleware.Chain`:
+- `Tracing[Req, Resp](operationName)`: an internal span named `operationName` around every call, with the error recorded and the status set on failure.
+- `Logging[Req, Resp](operationName, logger)`: one `Info` record per success and one `Error` record per failure, with the operation, the duration and the error, through the context-aware slog methods so they carry the trace and span IDs. A nil logger resolves `slog.Default()` on every call.
+- `Metrics[Req, Resp](recorder, operationName)`: one request, its latency and, on failure, one error on a `MetricsRecorder`, under `method=<operationName>`. The recorder's subsystem names the series (`auth_endpoint_requests_total` for `NewMetricsRecorder(meter, "auth_endpoint")`); share one recorder across the endpoints of a subsystem.
+
+None of them looks at the request or the response, so the type parameters only carry the endpoint's types through. go-kit's `endpoint.Endpoint` is `endpoint.Endpoint[any, any]` under another name, so for a go-kit endpoint instantiate with `[any, any]` and convert with `telemetry.Kit`, a type conversion with no assertion:
+```go
+greet = telemetry.Kit(telemetry.Tracing[any, any]("greet"))(greet)
+greet = telemetry.Kit(telemetry.Metrics[any, any](recorder, "greet"))(greet)
+```
+`MetricsMiddleware`, `LoggingMiddleware` and `TracingMiddleware` remain as deprecated go-kit wrappers over these. `MetricsMiddleware` now records on the subsystem `endpoint` (`endpoint_requests_total` with the attribute `method`) where it used to record `gokit_requests_total` with the attributes `operation` and `success`.
 
 ### Go-Kit Log Compatibility (`SlogAdapter`)
 Bridges the gap between legacy `go-kit/log.Logger` interfaces and modern standard `log/slog`. The go-kit `level` value becomes the slog level, `msg` the message, `err`/`error` the `error` attribute, and the conventional `ts` timestamp is dropped because slog stamps its own. Route go-kit logs directly through your globally registered OTel bridge:

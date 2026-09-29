@@ -9,8 +9,8 @@ their own Go module so that their dependencies never reach the library's
 |---|---|---|
 | [`middlegen/`](middlegen/) | nothing | Every `middlegen` directive on one interface, all four kinds of generated middleware, when deferred writes really run, `-dir` generation into another package, spans and metrics printed in-process. |
 | [`uow/`](uow/) | PostgreSQL | One service and one set of generated middlewares on top of three repositories: database/sql, sqlx and pgx. `RunWith` boundaries with the check in the write, a `//middlegen:in-tx` task, SERIALIZABLE retries under concurrency, the nesting rules. |
-| [`telemetry/`](telemetry/) | nothing | `InitTelemetry`, the go-kit endpoint middlewares, trace propagation over HTTP headers and gRPC metadata, the go-kit log adapter, the fan-out log handler. |
-| [`connectrpc/`](connectrpc/) | nothing | An SDK layout on the typed endpoints: a feature package with the `Service` interface, its endpoints and the Connect handler, a client package returning the same `Service`, a gateway made of the two, the generated decorators on both sides, the error code mapping of the adapters and a go-kit middleware on every endpoint through `telemetry.Adapt`. |
+| [`telemetry/`](telemetry/) | nothing | `InitTelemetry`, the endpoint middlewares on a go-kit endpoint through `telemetry.Kit`, trace propagation over HTTP headers and gRPC metadata, the go-kit log adapter, the fan-out log handler. |
+| [`connectrpc/`](connectrpc/) | nothing | An SDK layout on the typed endpoints: a feature package with the `Service` interface, its endpoints and the Connect handler, a client package returning the same `Service`, a gateway made of the two, the generated decorators on both sides through `middleware.Chain`, `telemetry.Metrics` on the endpoints and the error code mapping of the adapters. |
 
 ## Running
 
