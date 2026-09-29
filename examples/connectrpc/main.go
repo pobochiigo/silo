@@ -14,6 +14,7 @@ import (
 	"connectrpc.com/connect"
 
 	silorpc "github.com/pobochiigo/silo/connectrpc"
+	"github.com/pobochiigo/silo/telemetry"
 
 	greeterv1 "github.com/pobochiigo/silo/examples/connectrpc/gen/greeter/v1"
 	"github.com/pobochiigo/silo/examples/connectrpc/gen/greeter/v1/greeterv1connect"
@@ -42,9 +43,12 @@ func main() {
 	defer ts.Close()
 	fmt.Println("   serving", greeterv1connect.GreeterServiceName, "at", ts.URL)
 
-	demo.Step(2, "Client: the generated Connect client becomes a typed endpoint through NewConnectClient")
+	demo.Step(2, "Client: the generated Connect client becomes a typed endpoint through NewConnectClient, decorated by a go-kit middleware through telemetry.Adapt")
 	client := greeterv1connect.NewGreeterServiceClient(http.DefaultClient, ts.URL)
 	greetEndpoint := silorpc.NewConnectClient(client.Greet, encodeGreetRequest, decodeGreetResponse)
+	// The telemetry package's middlewares are written for go-kit endpoints;
+	// Adapt applies one to the typed endpoint without losing its types.
+	greetEndpoint = telemetry.Adapt[GreetRequest, GreetResponse](telemetry.LoggingMiddleware("greet.client", nil))(greetEndpoint)
 	greetEndpoint = timing[GreetRequest, GreetResponse]("client")(greetEndpoint)
 
 	resp, err := greetEndpoint(ctx, GreetRequest{Name: "Ada"})
