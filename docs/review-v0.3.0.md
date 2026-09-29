@@ -61,8 +61,8 @@ sees the request and response as `any`; one that replaces either with a
 value of another type makes the adapted endpoint return an error rather than
 panic on the type assertion, and nil interface values pass through. The type
 parameters must be spelled out, since Go cannot infer them from an untyped
-middleware. The connectrpc example applies `telemetry.LoggingMiddleware` to
-its client endpoint this way.
+middleware. The connectrpc example's `MakeEndpoints` applies go-kit
+middlewares to every endpoint this way.
 
 The adapter lives in `telemetry`, not in `endpoint`, on purpose. A first cut
 put it in `endpoint`, which made that package import go-kit; the `bhole`
