@@ -10,18 +10,33 @@ import (
 	"github.com/pobochiigo/silo/middleware"
 )
 
-// Adapt turns a go-kit endpoint middleware into a middleware for a typed
-// endpoint, so TracingMiddleware, LoggingMiddleware and MetricsMiddleware, or
-// any other go-kit middleware, decorate an endpoint.Endpoint[Req, Resp] the
-// way they decorate a go-kit endpoint:
+// Kit converts a middleware over endpoint.Endpoint[any, any] into a go-kit
+// endpoint middleware. go-kit's endpoint type is Endpoint[any, any] under
+// another name, so this is a type conversion: no assertion, no extra call.
+// It is how Tracing, Logging and Metrics, or any typed middleware
+// instantiated with [any, any], decorate a go-kit endpoint:
 //
-//	greet = telemetry.Adapt[GreetRequest, GreetResponse](telemetry.TracingMiddleware("greet"))(greet)
+//	ep = telemetry.Kit(telemetry.Tracing[any, any]("greet"))(ep)
+func Kit(mw middleware.Middleware[endpoint.Endpoint[any, any]]) kitendpoint.Middleware {
+	return func(next kitendpoint.Endpoint) kitendpoint.Endpoint {
+		return kitendpoint.Endpoint(mw(endpoint.Endpoint[any, any](next)))
+	}
+}
+
+// Adapt is the other direction: it turns a go-kit endpoint middleware, such
+// as go-kit's rate limiter or circuit breaker, into a middleware for a typed
+// endpoint:
+//
+//	greet = telemetry.Adapt[GreetRequest, GreetResponse](ratelimit.NewErroringLimiter(limiter))(greet)
+//
+// The go-kit middleware sees the request and the response as any, so this
+// direction needs a type assertion on the way back. One that replaces the
+// request or the response with a value of another type makes the adapted
+// endpoint return an error instead of panicking. Tracing, Logging and
+// Metrics need no adapting: instantiate them with the endpoint's types.
 //
 // It lives here rather than in the endpoint package so that package keeps no
-// dependency beyond the standard library. The go-kit middleware sees the
-// request and the response as any. One that replaces either with a value of
-// another type makes the adapted endpoint return an error instead of
-// panicking on the type assertion.
+// dependency beyond the standard library.
 func Adapt[Req any, Resp any](mw kitendpoint.Middleware) middleware.Middleware[endpoint.Endpoint[Req, Resp]] {
 	return func(next endpoint.Endpoint[Req, Resp]) endpoint.Endpoint[Req, Resp] {
 		untyped := mw(func(ctx context.Context, request any) (any, error) {

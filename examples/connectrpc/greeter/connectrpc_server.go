@@ -5,7 +5,6 @@ import (
 	"errors"
 
 	"connectrpc.com/connect"
-	kitendpoint "github.com/go-kit/kit/endpoint"
 
 	"github.com/pobochiigo/silo/connectrpc"
 
@@ -25,13 +24,12 @@ func (s *server) Greet(ctx context.Context, req *connect.Request[greeterv1.Greet
 	return s.greet(ctx, req)
 }
 
-// NewGreeterHandler adapts svc to the generated Connect handler interface:
-// one endpoint per method, each wrapped by mws and turned into a handler by
+// NewGreeterHandler is the transport layer: it turns the endpoints, decorated
+// or not, into the generated Connect handler interface, each through
 // connectrpc.NewConnectServer with its decoder and encoder. A client from
-// client/greeter is a Service too, so a handler can be backed by another
-// server, which makes a gateway.
-func NewGreeterHandler(svc Service, mws ...kitendpoint.Middleware) greeterv1connect.GreeterServiceHandler {
-	eps := MakeEndpoints(svc, mws...)
+// client/greeter is a Service too, so NewGreeterHandler(MakeEndpoints(client))
+// serves another server, which makes a gateway.
+func NewGreeterHandler(eps Endpoints) greeterv1connect.GreeterServiceHandler {
 	return &server{
 		greet: connectrpc.NewConnectServer(eps.Greet, decodeGreetRequest, encodeGreetResponse),
 	}

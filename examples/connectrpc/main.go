@@ -14,7 +14,9 @@ import (
 	"net/http/httptest"
 
 	"connectrpc.com/connect"
+	"go.opentelemetry.io/otel"
 
+	"github.com/pobochiigo/silo/middleware"
 	"github.com/pobochiigo/silo/telemetry"
 
 	greeterclient "github.com/pobochiigo/silo/examples/connectrpc/client/greeter"
@@ -32,19 +34,19 @@ func main() {
 	shutdown := demo.Telemetry(ctx, "silo-example-connectrpc", *verbose)
 	defer shutdown()
 
-	demo.Step(1, "Server: a Service implementation, decorated by the generated middlewares, becomes a Connect handler through NewGreeterHandler")
-	var svc greeter.Service = greeter.NewService()
-	svc = greeter.ServiceTracingMiddleware()(svc)
-	svc = greeter.ServiceLoggingMiddleware()(svc)
-	// The go-kit metrics middleware wraps every endpoint through telemetry.Adapt.
-	upstream := serve(greeter.NewGreeterHandler(svc, telemetry.MetricsMiddleware("greeter")))
+	demo.Step(1, "Server: Service, endpoints, transport. The generated decorators wrap the Service, telemetry.Metrics wraps the endpoint, NewGreeterHandler turns the endpoints into a Connect handler")
+	decorate := middleware.Chain(greeter.ServiceLoggingMiddleware(), greeter.ServiceTracingMiddleware())
+	svc := decorate(greeter.NewService())
+	// One recorder per subsystem names the series: greeter_endpoint_requests_total and so on.
+	recorder := telemetry.NewMetricsRecorder(otel.Meter("greeter"), "greeter_endpoint")
+	eps := greeter.MakeEndpoints(svc)
+	eps.Greet = telemetry.Metrics[*greeter.GreetRequest, *greeter.GreetResponse](recorder, "Greet")(eps.Greet)
+	upstream := serve(greeter.NewGreeterHandler(eps))
 	defer upstream.Close()
 	fmt.Println("   serving", greeterv1connect.GreeterServiceName, "at", upstream.URL)
 
 	demo.Step(2, "Client: NewGreeterClient returns the same Service interface, so the same decorators apply on this side")
-	var client greeter.Service = greeterclient.NewGreeterClient(http.DefaultClient, upstream.URL)
-	client = greeter.ServiceTracingMiddleware()(client)
-	client = greeter.ServiceLoggingMiddleware()(client)
+	client := decorate(greeterclient.NewGreeterClient(http.DefaultClient, upstream.URL))
 	resp, err := client.Greet(ctx, &greeter.GreetRequest{Name: "Ada"})
 	if err != nil {
 		demo.Fail("greet", err)
@@ -67,7 +69,7 @@ func main() {
 	}
 
 	demo.Step(5, "Gateway: a client is a Service, so a handler can be backed by another server; codes survive both hops")
-	gateway := serve(greeter.NewGreeterHandler(greeterclient.NewGreeterClient(http.DefaultClient, upstream.URL)))
+	gateway := serve(greeter.NewGreeterHandler(greeter.MakeEndpoints(greeterclient.NewGreeterClient(http.DefaultClient, upstream.URL))))
 	defer gateway.Close()
 	via := greeterclient.NewGreeterClient(http.DefaultClient, gateway.URL)
 	resp, err = via.Greet(ctx, &greeter.GreetRequest{Name: "Grace"})

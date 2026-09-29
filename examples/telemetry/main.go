@@ -55,7 +55,7 @@ func main() {
 	shutdown := demo.Telemetry(ctx, "silo-example-telemetry", *verbose)
 	defer shutdown()
 
-	demo.Step(1, "A go-kit endpoint wrapped with the tracing, logging and metrics middlewares, served over HTTP")
+	demo.Step(1, "A go-kit endpoint wrapped with the tracing, logging and metrics middlewares through Kit, served over HTTP")
 	// The business endpoint reports the trace ID it sees so the client can
 	// compare it with its own.
 	var greet endpoint.Endpoint = func(ctx context.Context, request any) (any, error) {
@@ -68,9 +68,13 @@ func main() {
 			TraceID:  trace.SpanContextFromContext(ctx).TraceID().String(),
 		}, nil
 	}
-	greet = telemetry.MetricsMiddleware("greet")(greet)
-	greet = telemetry.LoggingMiddleware("greet", nil)(greet)
-	greet = telemetry.TracingMiddleware("greet")(greet)
+	// go-kit's endpoint is endpoint.Endpoint[any, any] under another name, so
+	// the typed middlewares instantiated with [any, any] fit it through Kit.
+	// The metrics recorder's subsystem names the series: greet_endpoint_*.
+	recorder := telemetry.NewMetricsRecorder(otel.Meter("example"), "greet_endpoint")
+	greet = telemetry.Kit(telemetry.Metrics[any, any](recorder, "greet"))(greet)
+	greet = telemetry.Kit(telemetry.Logging[any, any]("greet", nil))(greet)
+	greet = telemetry.Kit(telemetry.Tracing[any, any]("greet"))(greet)
 
 	// go-kit's transport reports its own errors through a go-kit logger; the
 	// adapter routes them through slog, and so through the OTLP pipeline.
@@ -121,7 +125,7 @@ func main() {
 		// written to the traceparent header.
 		httptransport.ClientBefore(telemetry.InjectHTTPTraceContext()),
 	).Endpoint()
-	client = telemetry.TracingMiddleware("greet.client")(client)
+	client = telemetry.Kit(telemetry.Tracing[any, any]("greet.client"))(client)
 
 	// A root span stands for the caller's own work; everything below hangs off it.
 	rootCtx, root := otel.Tracer("example").Start(ctx, "example.main")
@@ -138,7 +142,7 @@ func main() {
 		demo.Fail("propagation", errors.New("the server did not join the client's trace"))
 	}
 
-	demo.Step(3, "An endpoint error: the span is marked, the log line is at Error level, the metric has success=false")
+	demo.Step(3, "An endpoint error: the span is marked, the log line is at Error level, the error counter grows")
 	_, err = client(ctx, greetRequest{Name: ""})
 	fmt.Printf("   client received: %v\n", err)
 
@@ -165,7 +169,7 @@ func main() {
 	slog.SetDefault(previous)
 	fmt.Printf("   fan-out counted %d info and %d error records\n", infos.Load(), errs.Load())
 
-	demo.Step(6, "Metrics recorded by MetricsMiddleware")
+	demo.Step(6, "Metrics recorded by the endpoint middleware")
 	demo.PrintMetrics(ctx)
 }
 

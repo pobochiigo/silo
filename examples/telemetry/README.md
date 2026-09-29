@@ -14,8 +14,10 @@ OTEL_EXPORTER_OTLP_ENDPOINT=localhost:4317 go run ./telemetry   # with docker co
 ## What the run shows
 
 1. **The middlewares.** The `greet` endpoint is wrapped with
-   `telemetry.MetricsMiddleware`, `telemetry.LoggingMiddleware` and
-   `telemetry.TracingMiddleware`, and served by go-kit's HTTP transport with
+   `telemetry.Metrics`, `telemetry.Logging` and `telemetry.Tracing`,
+   instantiated with `[any, any]` and converted by `telemetry.Kit`, since
+   go-kit's endpoint is `endpoint.Endpoint[any, any]` under another name. It
+   is served by go-kit's HTTP transport with
    `httptransport.ServerBefore(telemetry.ExtractHTTPTraceContext())`, which
    turns the incoming `traceparent` header into the parent of the server span.
    Transport errors are reported through `telemetry.NewSlogAdapter`, so
@@ -32,8 +34,8 @@ OTEL_EXPORTER_OTLP_ENDPOINT=localhost:4317 go run ./telemetry   # with docker co
       trace id seen by the server: 44c2d3b9a9d5f8e1957f6cccd7511ffa
    ```
 3. **An endpoint error.** The server span carries the error and its status,
-   the log line is at Error level with the `error` attribute, and the metrics
-   get a `success=false` series. go-kit answers with status 500 and the error
+   the log line is at Error level with the `error` attribute, and the error
+   counter grows. go-kit answers with status 500 and the error
    text, which the client decoder hands back.
 4. **Propagation over gRPC metadata.** `telemetry.InjectGRPCTraceContext`
    writes the active span into a `metadata.MD`, and
@@ -44,8 +46,9 @@ OTEL_EXPORTER_OTLP_ENDPOINT=localhost:4317 go run ./telemetry   # with docker co
    maps `level`, `msg` and `err` to slog and drops `ts`.
    `telemetry.NewFanoutHandler` sends every record to both the existing
    handler and a counting handler.
-6. **Metrics.** `gokit_requests_total` and `gokit_request_duration_seconds`,
-   labelled with `operation` and `success`.
+6. **Metrics.** `greet_endpoint_requests_total`, `greet_endpoint_errors_total`
+   and `greet_endpoint_request_duration_seconds`, labelled with `method`. The
+   recorder's subsystem, `greet_endpoint`, names them.
 
 ## Things worth copying
 
@@ -53,6 +56,6 @@ OTEL_EXPORTER_OTLP_ENDPOINT=localhost:4317 go run ./telemetry   # with docker co
   write: `telemetry.InitTelemetry` with the endpoint from the environment,
   `Insecure` for a plaintext collector, and a deferred shutdown with its own
   timeout.
-- Build decorators that capture `slog.Default()` after `InitTelemetry`; the
-  go-kit `LoggingMiddleware` with a nil logger and the slog adapter resolve
-  the default lazily, so their order does not matter.
+- Build the generated decorators, which capture `slog.Default()`, after
+  `InitTelemetry`; `telemetry.Logging` with a nil logger and the slog
+  adapter resolve the default lazily, so their order does not matter.
