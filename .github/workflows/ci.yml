@@ -100,3 +100,36 @@ jobs:
 
       - name: Run the connectrpc example
         run: go run ./connectrpc
+
+  # A push to main whose head commit subject is "release: vX.Y.Z" asks for
+  # that release. The version is parsed here and the release job below cuts
+  # it once the test and examples jobs have passed; any other push leaves the
+  # version empty and the release job is skipped.
+  release-version:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+    steps:
+      - id: parse
+        env:
+          MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          subject="${MESSAGE%%$'\n'*}"
+          if [[ "$subject" =~ ^\(?release\)?:?[[:space:]]+(v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)([[:space:]]|$) ]]; then
+            echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+            echo "release ${BASH_REMATCH[1]} requested by the head commit: $subject"
+          elif [[ "$subject" =~ ^\(?release\)?(:|[[:space:]]) ]]; then
+            echo "::warning::head commit subject '$subject' starts with release but names no vX.Y.Z version; not releasing"
+          else
+            echo "not a release commit: $subject"
+          fi
+
+  release:
+    needs: [test, examples, release-version]
+    if: needs.release-version.outputs.version != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      version: ${{ needs.release-version.outputs.version }}

@@ -59,7 +59,9 @@ See [`examples/README.md`](examples/README.md) for the details.
 
 ## Releasing
 
-Releases are cut from the GitHub Actions tab: run the **Release** workflow with the version to publish (for example `v0.1.0`). It verifies the module on the selected ref, creates the annotated tag, publishes a GitHub Release with generated notes, and asks the Go module proxy to index the new version.
+A release is a commit on `main` whose subject is `release: vX.Y.Z`, for example the commit that moves the version pins in this README. When CI passes on that push it runs the **Release** workflow for that version: an annotated tag on the commit, a GitHub Release with generated notes, and a request to the Go module proxy to index the new version. The release commit has to be the head of the push to `main`, so make it the last commit of the pull request (or the pull request title, with a squash merge); a merge commit's own subject does not qualify, and a push without such a commit releases nothing.
+
+The same workflow can be run by hand from the Actions tab with the version to publish, for a release from another ref or without a release commit. In both cases the version must look like `v1.2.3` or `v1.2.3-rc.1` and the tag must not exist yet.
 
 ---
 
