@@ -1,11 +1,22 @@
 name: Release
 
-# Cuts a release from the Actions tab: verifies the module, creates an
-# annotated tag on the chosen ref, and publishes a GitHub Release with
-# generated notes. Go module consumers pick the tag up from the module proxy.
+# Cuts a release: verifies the module, creates an annotated tag on the
+# checked-out commit, and publishes a GitHub Release with generated notes.
+# Go module consumers pick the tag up from the module proxy.
+#
+# Two ways in:
+#   - CI calls this workflow when a push to main has a head commit whose
+#     subject is "release: vX.Y.Z" and every other CI job has passed.
+#   - Run it by hand from the Actions tab with the version to publish.
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. v0.1.0"
+        required: true
+        type: string
+  workflow_call:
     inputs:
       version:
         description: "Version to release, e.g. v0.1.0"
