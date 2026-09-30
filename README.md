@@ -31,7 +31,7 @@ go install github.com/pobochiigo/silo/cmd/middlegen@$(go list -m -f '{{.Version}
 ```
 or let `go generate` fetch a pinned version on demand:
 ```go
-//go:generate go run github.com/pobochiigo/silo/cmd/middlegen@v0.3.0 -type=UserRepository -kinds=uow_repo,logging,tracing
+//go:generate go run github.com/pobochiigo/silo/cmd/middlegen@v0.4.0 -type=UserRepository -kinds=uow_repo,logging,tracing
 ```
 
 ---
@@ -445,7 +445,7 @@ Run Go generate from your shell:
 ```bash
 go generate ./...
 ```
-The `//go:generate go tool middlegen` lines use the generator recorded in `go.mod` (see [Installation](#installation)); with an installed binary write `//go:generate middlegen ...` instead, and with neither use the `go run ...@v0.3.0` form. Regenerating is always safe: previously generated `.gen.go` files are ignored while the package is loaded, so stale output that no longer compiles does not block the generator.
+The `//go:generate go tool middlegen` lines use the generator recorded in `go.mod` (see [Installation](#installation)); with an installed binary write `//go:generate middlegen ...` instead, and with neither use the `go run ...@v0.4.0` form. Regenerating is always safe: previously generated `.gen.go` files are ignored while the package is loaded, so stale output that no longer compiles does not block the generator.
 
 This automatically produces the following decorators inside your package directories:
 - `user_repository_logging_middleware.gen.go`
